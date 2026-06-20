@@ -704,7 +704,7 @@ async fn run_seller_ws_loop(
     let mut backoff_secs = 1u64;
     loop {
         println!("Connecting to {} (backoff={}s)...", ws_url, backoff_secs);
-        match try_seller_connection(&ws_url, pool.clone()).await {
+        match try_seller_connection(&ws_url, token, pool.clone()).await {
             Ok(()) => {
                 // Clean disconnect — reset backoff and reconnect immediately
                 backoff_secs = 1;
@@ -721,6 +721,7 @@ async fn run_seller_ws_loop(
 
 async fn try_seller_connection(
     ws_url: &str,
+    token: &str,
     pool: std::sync::Arc<Vec<Option<UpstreamProxy>>>,
 ) -> Result<()> {
     let (ws, _resp) = connect_async(ws_url).await.context("Failed to connect WebSocket")?;
@@ -728,6 +729,13 @@ async fn try_seller_connection(
     println!("Connected (conn={}). Press Ctrl+C to stop.", &conn_id[..8]);
 
     let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // Send auth token as the first message (required by standalone WS listener on port 1081).
+    ws_sink
+        .send(Message::Text(token.to_string()))
+        .await
+        .context("Failed to send auth token")?;
+
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let active: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> = Default::default();
 
