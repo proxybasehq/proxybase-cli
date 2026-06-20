@@ -220,6 +220,20 @@ fn seller_daemon() -> daemon_kit::Daemon {
     daemon_kit::Daemon::new(config)
 }
 
+/// Shared async seller entry point. Called directly in foreground mode,
+/// or via a fresh runtime in daemon mode.
+async fn run_seller(proxies: &[UpstreamProxy], include_direct: bool) {
+    let daemon_client = BackendClient::new(DEFAULT_BACKEND_URL);
+    if !daemon_client.is_authenticated() {
+        eprintln!("[seller] Not authenticated. Run 'proxybase-cli login' first.");
+        return;
+    }
+    let _ = daemon_client.register_seller().await;
+    if let Err(e) = run_seller_ws_loop(&daemon_client, proxies.to_vec(), include_direct).await {
+        eprintln!("[seller] Loop error: {e}");
+    }
+}
+
 #[derive(Subcommand)]
 enum MarketCmd {
     /// List available countries
@@ -964,26 +978,18 @@ async fn main() -> Result<()> {
                         (false, n) => println!("Reselling via {} upstream(s) only (no direct)", n),
                     }
 
-                    // Build the seller loop closure
+                    // Build the seller loop closure (for daemon mode — creates its own runtime).
+                    let proxies2 = proxies.clone();
                     let seller_loop = move || -> daemon_kit::Result<()> {
                         let rt = tokio::runtime::Runtime::new()
                             .map_err(|e| daemon_kit::DaemonError::Daemonize(e.to_string()))?;
-                        rt.block_on(async {
-                            let daemon_client = BackendClient::new(DEFAULT_BACKEND_URL);
-                            if !daemon_client.is_authenticated() {
-                                eprintln!("[seller daemon] Not authenticated. Run 'proxybase-cli login' first.");
-                                return;
-                            }
-                            let _ = daemon_client.register_seller().await;
-                            if let Err(e) = run_seller_ws_loop(&daemon_client, proxies, include_direct).await {
-                                eprintln!("[seller daemon] Seller loop error: {e}");
-                            }
-                        });
+                        rt.block_on(run_seller(&proxies2, include_direct));
                         Ok(())
                     };
 
                     if foreground {
-                        seller_loop()?;
+                        // Already inside a tokio runtime — run directly.
+                        run_seller(&proxies, include_direct).await;
                     } else {
                         let daemon = seller_daemon();
                         // Auto-install the OS autostart service so seller survives reboots.
