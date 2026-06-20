@@ -223,13 +223,13 @@ fn seller_daemon() -> daemon_kit::Daemon {
 /// Shared async seller entry point. Called directly in foreground mode,
 /// or via a fresh runtime in daemon mode.
 async fn run_seller(proxies: &[UpstreamProxy], include_direct: bool) {
-    let daemon_client = BackendClient::new(DEFAULT_BACKEND_URL);
-    if !daemon_client.is_authenticated() {
+    let client = BackendClient::new(DEFAULT_BACKEND_URL);
+    if !client.is_authenticated() {
         eprintln!("[seller] Not authenticated. Run 'proxybase-cli login' first.");
         return;
     }
-    let _ = daemon_client.register_seller().await;
-    if let Err(e) = run_seller_ws_loop(&daemon_client, proxies.to_vec(), include_direct).await {
+    let _ = client.register_seller().await;
+    if let Err(e) = run_seller_ws_loop(client, proxies.to_vec(), include_direct).await {
         eprintln!("[seller] Loop error: {e}");
     }
 }
@@ -681,7 +681,7 @@ fn base64_decode(encoded: &str) -> Option<Vec<u8>> {
 }
 
 async fn run_seller_ws_loop(
-    client: &BackendClient,
+    mut client: BackendClient,
     upstreams: Vec<UpstreamProxy>,
     include_direct: bool,
 ) -> Result<()> {
@@ -693,22 +693,34 @@ async fn run_seller_ws_loop(
     };
     let pool = std::sync::Arc::new(pool);
 
-    let token = client.token.as_deref().unwrap_or("");
-    let ws_url = format!(
-        "{}/v2/ws/seller?token={}",
-        client.base_url.replace("http://", "ws://").replace("https://", "wss://"),
-        token
-    );
-
-    // Auto-reconnect loop with exponential backoff: 1s → 2s → 4s → ... → 60s max, ±20% jitter
     let mut backoff_secs = 1u64;
     loop {
+        let token = client.token.as_deref().unwrap_or("").to_string();
+        let ws_url = format!(
+            "{}/v2/ws/seller?token={}",
+            client.base_url.replace("http://", "ws://").replace("https://", "wss://"),
+            token
+        );
+
         println!("Connecting to {} (backoff={}s)...", ws_url, backoff_secs);
-        match try_seller_connection(&ws_url, token, pool.clone()).await {
+        match try_seller_connection(&ws_url, &token, pool.clone()).await {
             Ok(()) => {
-                // Clean disconnect — reset backoff and reconnect immediately
                 backoff_secs = 1;
                 eprintln!("Disconnected. Reconnecting...");
+            }
+            Err(e) if e.to_string().contains("AUTH_EXPIRED") => {
+                eprintln!("Session token expired or invalid. Re-authenticating...");
+                match re_authenticate(&mut client).await {
+                    Ok(()) => {
+                        eprintln!("Re-authenticated successfully.");
+                        backoff_secs = 1;
+                    }
+                    Err(auth_err) => {
+                        eprintln!("Re-authentication failed: {}. Retrying in {}s...", auth_err, backoff_secs);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(60);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Connection failed: {}. Retrying in {}s...", e, backoff_secs);
@@ -717,6 +729,25 @@ async fn run_seller_ws_loop(
             }
         }
     }
+}
+
+async fn re_authenticate(client: &mut BackendClient) -> Result<()> {
+    let wm = load_wallet()
+        .context("No wallet found. Cannot re-authenticate.")?;
+    let address = wm.address()
+        .ok_or_else(|| anyhow::anyhow!("Wallet not loaded"))?;
+
+    let challenge = client.auth_challenge(address).await?;
+    let message = format!("{}:{}:{}", address, challenge.nonce, challenge.timestamp);
+    let signature = wm.sign(message.as_bytes())?;
+    let sig_hex = hex::encode(&signature);
+    let public_key_hex = wm.public_key_hex()
+        .ok_or_else(|| anyhow::anyhow!("Cannot get public key"))?;
+
+    let auth = client.auth_verify(&public_key_hex, &challenge.nonce, &challenge.timestamp, &sig_hex).await?;
+    BackendClient::save_token(&auth.session_token);
+    client.token = Some(auth.session_token);
+    Ok(())
 }
 
 async fn try_seller_connection(
@@ -762,6 +793,10 @@ async fn try_seller_connection(
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(p) = serde_json::from_str::<serde_json::Value>(&text) {
+                            // Detect auth-token rejection from the server
+                            if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
+                                return Err(anyhow::anyhow!("AUTH_EXPIRED"));
+                            }
                             match p.get("type").and_then(|v| v.as_str()) {
                                 Some("relay_data") => {
                                     if let Some(enc) = p.get("data").and_then(|v| v.as_str()) {
