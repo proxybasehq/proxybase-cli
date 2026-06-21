@@ -1022,17 +1022,17 @@ async fn main() -> Result<()> {
                     }
 
                     if foreground {
+                        // Write PID file so 'seller stop' can find us.
+                        let pid_path = wallet_dir().join("proxybase-seller.pid");
+                        if let Some(parent) = pid_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
                         // Already inside a tokio runtime — run directly.
                         run_seller(&cli.backend, &proxies, include_direct).await;
                     } else {
                         let daemon = seller_daemon();
-                        // Auto-install the OS autostart service so seller survives reboots.
-                        // Idempotent — safe to call every time.
-                        if let Err(e) = daemon.install_service() {
-                            eprintln!("Warning: could not install autostart service: {e}");
-                        } else {
-                            eprintln!("Autostart service installed (seller will survive reboots).");
-                        }
 
                         if daemon.is_running() {
                             anyhow::bail!("Seller daemon already running (PID: {}). Use 'seller stop' first, or 'seller status'.", daemon.running_pid().unwrap_or(0));
