@@ -222,8 +222,8 @@ fn seller_daemon() -> daemon_kit::Daemon {
 
 /// Shared async seller entry point. Called directly in foreground mode,
 /// or via a fresh runtime in daemon mode.
-async fn run_seller(proxies: &[UpstreamProxy], include_direct: bool) {
-    let client = BackendClient::new(DEFAULT_BACKEND_URL);
+async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct: bool) {
+    let client = BackendClient::new(backend_url);
     if !client.is_authenticated() {
         eprintln!("[seller] Not authenticated. Run 'proxybase-cli login' first.");
         return;
@@ -1023,7 +1023,7 @@ async fn main() -> Result<()> {
 
                     if foreground {
                         // Already inside a tokio runtime — run directly.
-                        run_seller(&proxies, include_direct).await;
+                        run_seller(&cli.backend, &proxies, include_direct).await;
                     } else {
                         let daemon = seller_daemon();
                         // Auto-install the OS autostart service so seller survives reboots.
@@ -1043,6 +1043,18 @@ async fn main() -> Result<()> {
                         // runtime" panic from daemonize2 + tokio interaction).
                         let exe = std::env::current_exe()
                             .context("Cannot determine current executable path")?;
+
+                        // Open log file for the daemon's stdout/stderr
+                        let log_path = wallet_dir().join("seller.log");
+                        if let Some(parent) = log_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let log_file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log_path)
+                            .context("Cannot open seller log file")?;
+
                         let mut cmd = std::process::Command::new(&exe);
                         cmd.arg("seller")
                            .arg("start")
@@ -1050,8 +1062,8 @@ async fn main() -> Result<()> {
                            .arg("--backend")
                            .arg(&cli.backend)
                            .stdin(std::process::Stdio::null())
-                           .stdout(std::process::Stdio::null())
-                           .stderr(std::process::Stdio::null());
+                           .stdout(log_file.try_clone()?)
+                           .stderr(log_file);
                         let child = cmd.spawn()
                             .context("Failed to spawn seller daemon process")?;
 
@@ -1063,6 +1075,7 @@ async fn main() -> Result<()> {
                         let _ = std::fs::write(&pid_path, child.id().to_string());
 
                         println!("Seller daemon started in background (PID: {}).", child.id());
+                        println!("Logs: {}", log_path.display());
                     }
                 }
                 SellerCmd::Status => {
