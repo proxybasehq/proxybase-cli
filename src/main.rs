@@ -1021,15 +1021,6 @@ async fn main() -> Result<()> {
                         (false, n) => println!("Reselling via {} upstream(s) only (no direct)", n),
                     }
 
-                    // Build the seller loop closure (for daemon mode — creates its own runtime).
-                    let proxies2 = proxies.clone();
-                    let seller_loop = move || -> daemon_kit::Result<()> {
-                        let rt = tokio::runtime::Runtime::new()
-                            .map_err(|e| daemon_kit::DaemonError::Daemonize(e.to_string()))?;
-                        rt.block_on(run_seller(&proxies2, include_direct));
-                        Ok(())
-                    };
-
                     if foreground {
                         // Already inside a tokio runtime — run directly.
                         run_seller(&proxies, include_direct).await;
@@ -1042,13 +1033,36 @@ async fn main() -> Result<()> {
                         } else {
                             eprintln!("Autostart service installed (seller will survive reboots).");
                         }
-                        match daemon.start(false, seller_loop) {
-                            Ok(()) => println!("Seller daemon started in background."),
-                            Err(daemon_kit::DaemonError::AlreadyRunning(pid)) => {
-                                anyhow::bail!("Seller daemon already running (PID: {pid}). Use 'seller stop' first, or 'seller status'.");
-                            }
-                            Err(e) => anyhow::bail!("Failed to start daemon: {e}"),
+
+                        if daemon.is_running() {
+                            anyhow::bail!("Seller daemon already running (PID: {}). Use 'seller stop' first, or 'seller status'.", daemon.running_pid().unwrap_or(0));
                         }
+
+                        // Spawn a detached child process instead of forking within the
+                        // tokio runtime (avoids "Cannot start a runtime from within a
+                        // runtime" panic from daemonize2 + tokio interaction).
+                        let exe = std::env::current_exe()
+                            .context("Cannot determine current executable path")?;
+                        let mut cmd = std::process::Command::new(&exe);
+                        cmd.arg("seller")
+                           .arg("start")
+                           .arg("--foreground")
+                           .arg("--backend")
+                           .arg(&cli.backend)
+                           .stdin(std::process::Stdio::null())
+                           .stdout(std::process::Stdio::null())
+                           .stderr(std::process::Stdio::null());
+                        let child = cmd.spawn()
+                            .context("Failed to spawn seller daemon process")?;
+
+                        // Write PID file ourselves (daemon-kit expects it for stop/status).
+                        let pid_path = wallet_dir().join("proxybase-seller.pid");
+                        if let Some(parent) = pid_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&pid_path, child.id().to_string());
+
+                        println!("Seller daemon started in background (PID: {}).", child.id());
                     }
                 }
                 SellerCmd::Status => {
