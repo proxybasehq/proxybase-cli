@@ -103,8 +103,6 @@ enum SellerCmd {
     },
     /// Install seller as a system service (launchd/systemd) — survives reboots
     Install,
-    /// Remove the system service
-    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -168,6 +166,25 @@ struct UpstreamProxy {
     address: String,
     username: String,
     password: String,
+    /// Parsed from --upstream-user (e.g. "type_residential" → "residential").
+    country: Option<String>,
+    proxy_category: Option<String>,
+}
+
+/// Parse country and proxy_category from an upstream username.
+/// Format: `user_2930d5,type_residential,country_US,session_usresidential`
+/// Extracts: country="US", proxy_category="residential"
+fn parse_upstream_metadata(username: &str) -> (Option<String>, Option<String>) {
+    let mut country = None;
+    let mut category = None;
+    for part in username.split(',') {
+        if let Some(c) = part.strip_prefix("country_") {
+            country = Some(c.to_uppercase());
+        } else if let Some(net) = part.strip_prefix("type_") {
+            category = Some(net.to_lowercase());
+        }
+    }
+    (country, category)
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +202,8 @@ struct UpstreamProxyConfig {
     address: String,
     username: String,
     password: String,
+    country: Option<String>,
+    proxy_category: Option<String>,
 }
 
 fn seller_config_path() -> std::path::PathBuf {
@@ -220,8 +239,24 @@ fn seller_daemon() -> daemon_kit::Daemon {
     daemon_kit::Daemon::new(config)
 }
 
-/// Shared async seller entry point. Called directly in foreground mode,
-/// or via a fresh runtime in daemon mode.
+/// Build the list of paths: direct (None) + each upstream proxy.
+fn build_paths(upstreams: &[UpstreamProxy], include_direct: bool) -> Vec<(String, Option<UpstreamProxy>)> {
+    let mut paths: Vec<(String, Option<UpstreamProxy>)> = Vec::new();
+    if include_direct {
+        paths.push(("direct".to_string(), None));
+    }
+    for (i, u) in upstreams.iter().enumerate() {
+        paths.push((format!("upstream_{}", i), Some(u.clone())));
+    }
+    if paths.is_empty() {
+        // At least one path — direct with no upstream
+        paths.push(("direct".to_string(), None));
+    }
+    paths
+}
+
+/// Shared async seller entry point. Opens one WebSocket connection per path
+/// (direct + each upstream) so each path is independently classified and matched.
 async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct: bool) {
     let client = BackendClient::new(backend_url);
     if !client.is_authenticated() {
@@ -229,8 +264,26 @@ async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct
         return;
     }
     let _ = client.register_seller().await;
-    if let Err(e) = run_seller_ws_loop(client, proxies.to_vec(), include_direct).await {
-        eprintln!("[seller] Loop error: {e}");
+
+    let paths = build_paths(proxies, include_direct);
+    let token = client.token.as_deref().unwrap_or("").to_string();
+    let base_url = backend_url.to_string();
+
+    eprintln!("[seller] Starting {} path(s): {:?}", paths.len(), paths.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
+
+    // Spawn one connection per path — each runs independently with its own reconnect loop
+    let mut handles = Vec::new();
+    for (path_id, upstream) in paths {
+        let t = token.clone();
+        let url = base_url.clone();
+        handles.push(tokio::spawn(async move {
+            run_single_path_loop(&url, &t, &path_id, upstream.as_ref()).await;
+        }));
+    }
+
+    // Wait for all connections (they run forever unless all fail permanently)
+    for h in handles {
+        let _ = h.await;
     }
 }
 
@@ -562,7 +615,8 @@ struct VerifyResponse {
 
 /// Run a bidirectional relay for one stream. Handles both direct TCP and upstream SOCKS5.
 async fn run_stream_relay(
-    target_ip: &str,
+    target_dest: &str, // Domain or IP for SOCKS5 routing
+    target_ip: &str,   // IP only for direct TCP routing
     target_port: u16,
     upstream: Option<&UpstreamProxy>,
     relay_tx: &tokio::sync::mpsc::UnboundedSender<Message>,
@@ -579,7 +633,7 @@ async fn run_stream_relay(
             eprintln!("[RELAY {}] Using upstream proxy {} (user={})", sid, proxy.address, proxy.username);
             match fast_socks5::client::Socks5Stream::connect_with_password(
                 &proxy.address,
-                target_ip.to_string(),
+                target_dest.to_string(),
                 target_port,
                 proxy.username.clone(),
                 proxy.password.clone(),
@@ -678,6 +732,150 @@ fn base64_decode(encoded: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Single-path WebSocket connection loop. Handles one path (direct or one upstream).
+/// Reconnects with exponential backoff. Sends auth token + path_info on each connect.
+async fn run_single_path_loop(
+    backend_url: &str,
+    token: &str,
+    path_id: &str,
+    upstream: Option<&UpstreamProxy>,
+) {
+    let ws_url = format!(
+        "{}/v2/ws/seller?token={}",
+        backend_url.replace("https://", "wss://").replace("http://", "ws://"),
+        token
+    );
+
+    let upstream = upstream.cloned();
+    let path_id = path_id.to_string();
+    let mut backoff_secs = 1u64;
+
+    loop {
+        eprintln!("[{}] Connecting to {} (backoff={}s)...", path_id, ws_url, backoff_secs);
+        match try_single_path_connection(&ws_url, token, &path_id, upstream.as_ref()).await {
+            Ok(()) => {
+                backoff_secs = 1;
+                eprintln!("[{}] Disconnected. Reconnecting...", path_id);
+            }
+            Err(e) if e.to_string().contains("AUTH_EXPIRED") => {
+                eprintln!("[{}] Session token expired. Cannot re-auth in single-path mode.", path_id);
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
+            }
+            Err(e) => {
+                eprintln!("[{}] Connection failed: {}. Retrying in {}s...", path_id, e, backoff_secs);
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
+            }
+        }
+    }
+}
+
+/// Establish one WebSocket connection for a single path and relay until disconnect.
+async fn try_single_path_connection(
+    ws_url: &str,
+    token: &str,
+    path_id: &str,
+    upstream: Option<&UpstreamProxy>,
+) -> Result<()> {
+    let (ws, _resp) = connect_async(ws_url).await.context("Failed to connect WebSocket")?;
+    let conn_id = uuid::Uuid::new_v4().to_string();
+    eprintln!("[{}] Connected (conn={}).", path_id, &conn_id[..8]);
+
+    let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // Send auth token as first message
+    ws_sink
+        .send(Message::Text(token.to_string()))
+        .await
+        .context("Failed to send auth token")?;
+
+    // Send path_info to identify this connection's path.
+    // Country and proxy_category are NOT sent — the backend discovers them
+    // through QoS probes + IP intelligence, same as direct connections.
+    let path_info = serde_json::json!({"type": "path_info", "path_id": path_id});
+    ws_sink
+        .send(Message::Text(serde_json::to_string(&path_info).unwrap_or_default()))
+        .await
+        .context("Failed to send path_info")?;
+
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let active: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> = Default::default();
+
+    let relay_drain = tokio::spawn(async move {
+        while let Some(msg) = relay_rx.recv().await {
+            if ws_sink.send(msg).await.is_err() { break; }
+        }
+    });
+
+    let upstream = upstream.cloned();
+    let mut ping_tick = interval(Duration::from_secs(30));
+    let mut heartbeat_tick = interval(Duration::from_secs(60));
+    let mut stream_count: u32 = 0;
+
+    loop {
+        tokio::select! {
+            _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
+            _ = heartbeat_tick.tick() => {
+                let hb = serde_json::json!({"type":"heartbeat","active_streams":stream_count,"version":"0.1.0","conn_id":conn_id});
+                let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
+            }
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(Message::Ping(d))) => { let _ = relay_tx.send(Message::Pong(d)); }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
+                                return Err(anyhow::anyhow!("AUTH_EXPIRED"));
+                            }
+                            match p.get("type").and_then(|v| v.as_str()) {
+                                Some("relay_data") => {
+                                    if let Some(enc) = p.get("data").and_then(|v| v.as_str()) {
+                                        if let Some(dec) = base64_decode(enc) {
+                                            let streams = active.lock().await;
+                                            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                                            if let Some(s) = streams.get(sid) { let _ = s.send(dec); }
+                                            else { for (_, s) in streams.iter() { let _ = s.send(dec.clone()); break; } }
+                                        }
+                                    }
+                                }
+                                Some("stream_open") => {
+                                    let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                                    let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
+                                    let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
+                                    let thost = p.get("target_host").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    let dest = thost.unwrap_or_else(|| tip.clone());
+                                    eprintln!("[{}] STREAM {} → {}:{} (direct_ip={})", path_id, sid, dest, tport, tip);
+
+                                    let streams = active.clone();
+                                    let tx = relay_tx.clone();
+                                    let up = upstream.clone();
+                                    stream_count += 1;
+
+                                    let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                                    streams.lock().await.insert(sid.clone(), tcp_tx);
+
+                                    tokio::spawn(async move {
+                                        run_stream_relay(&dest, &tip, tport, up.as_ref(), &tx, tcp_rx, &sid).await;
+                                        streams.lock().await.remove(&sid);
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => { eprintln!("[{}] Backend closed connection", path_id); break; }
+                    Some(Err(e)) => { eprintln!("[{}] WS error: {}", path_id, e); break; }
+                    _ => {}
+                }
+            }
+        }
+    }
+    relay_drain.abort();
+    Ok(())
 }
 
 async fn run_seller_ws_loop(
@@ -812,11 +1010,13 @@ async fn try_seller_connection(
                                     let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
                                     let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
                                     let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
+                                    let thost = p.get("target_host").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    let dest = thost.unwrap_or_else(|| tip.clone());
                                     // Backend controls routing: use route_index if provided, else hash session_id
                                     let route_idx = p.get("route_index")
                                         .and_then(|v| v.as_u64())
                                         .map(|i| i as usize);
-                                    eprintln!("[STREAM] {} → {}:{}", sid, tip, tport);
+                                    eprintln!("[STREAM] {} → {}:{} (direct_ip={})", sid, dest, tport, tip);
 
                                     let streams = active.clone();
                                     let tx = relay_tx.clone();
@@ -833,7 +1033,7 @@ async fn try_seller_connection(
 
                                     tokio::spawn(async move {
                                         let up_ref: Option<&UpstreamProxy> = up.as_ref();
-                                        run_stream_relay(&tip, tport, up_ref, &tx, tcp_rx, &sid).await;
+                                        run_stream_relay(&dest, &tip, tport, up_ref, &tx, tcp_rx, &sid).await;
                                         streams.lock().await.remove(&sid);
                                     });
                                 }
@@ -946,10 +1146,17 @@ async fn main() -> Result<()> {
             match cmd {
                 SellerCmd::Stop => {
                     let daemon = seller_daemon();
+                    // Stop the running daemon
                     match daemon.stop() {
                         Ok(()) => println!("Seller daemon stopped."),
                         Err(daemon_kit::DaemonError::NotRunning) => println!("Seller daemon is not running."),
                         Err(e) => anyhow::bail!("Failed to stop daemon: {e}"),
+                    }
+                    // Also remove the OS autostart service
+                    if let Err(e) = daemon.uninstall_service() {
+                        eprintln!("Warning: could not uninstall autostart service: {e}");
+                    } else {
+                        println!("Autostart service removed.");
                     }
                     return Ok(());
                 }
@@ -957,13 +1164,6 @@ async fn main() -> Result<()> {
                     let daemon = seller_daemon();
                     daemon.install_service()?;
                     println!("Seller service installed. It will auto-start on boot.");
-                    println!("Use 'seller uninstall' to remove.");
-                    return Ok(());
-                }
-                SellerCmd::Uninstall => {
-                    let daemon = seller_daemon();
-                    daemon.uninstall_service()?;
-                    println!("Seller service uninstalled.");
                     return Ok(());
                 }
                 _ => {}
@@ -977,10 +1177,15 @@ async fn main() -> Result<()> {
                 SellerCmd::Start { upstream_hosts, upstream_users, upstream_passes, no_direct, foreground } => {
                     // Build proxy list from args
                     let n = upstream_hosts.len().min(upstream_users.len()).min(upstream_passes.len());
-                    let proxies: Vec<UpstreamProxy> = (0..n).map(|i| UpstreamProxy {
-                        address: upstream_hosts[i].clone(),
-                        username: upstream_users[i].clone(),
-                        password: upstream_passes[i].clone(),
+                    let proxies: Vec<UpstreamProxy> = (0..n).map(|i| {
+                        let (country, proxy_category) = parse_upstream_metadata(&upstream_users[i]);
+                        UpstreamProxy {
+                            address: upstream_hosts[i].clone(),
+                            username: upstream_users[i].clone(),
+                            password: upstream_passes[i].clone(),
+                            country,
+                            proxy_category,
+                        }
                     }).collect();
                     if upstream_hosts.len() != n || upstream_users.len() != n || upstream_passes.len() != n {
                         eprintln!("Warning: --upstream, --upstream-user, --upstream-pass counts differ. Using {} proxy(s).", n);
@@ -988,12 +1193,14 @@ async fn main() -> Result<()> {
 
                     // Save config if upstream args provided (so daemon can restart without args)
                     let has_upstream_args = !upstream_hosts.is_empty() || !upstream_users.is_empty() || !upstream_passes.is_empty();
-                    if has_upstream_args || foreground {
+                    if has_upstream_args {
                         let config = SellerConfig {
                             upstream_proxies: proxies.iter().map(|p| UpstreamProxyConfig {
                                 address: p.address.clone(),
                                 username: p.username.clone(),
                                 password: p.password.clone(),
+                                country: p.country.clone(),
+                                proxy_category: p.proxy_category.clone(),
                             }).collect(),
                             no_direct,
                         };
@@ -1007,6 +1214,8 @@ async fn main() -> Result<()> {
                             address: u.address.clone(),
                             username: u.username.clone(),
                             password: u.password.clone(),
+                            country: u.country.clone(),
+                            proxy_category: u.proxy_category.clone(),
                         }).collect();
                         let include = !config.no_direct;
                         (p, include)
@@ -1090,7 +1299,7 @@ async fn main() -> Result<()> {
                         Err(e) => println!("Backend: unreachable ({e})"),
                     }
                 }
-                SellerCmd::Stop | SellerCmd::Install | SellerCmd::Uninstall => {
+                SellerCmd::Stop | SellerCmd::Install => {
                     // Handled above (before auth check)
                     unreachable!();
                 }
@@ -1223,4 +1432,121 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_upstream(addr: &str, user: &str, pass: &str) -> UpstreamProxy {
+        UpstreamProxy {
+            address: addr.to_string(),
+            username: user.to_string(),
+            password: pass.to_string(),
+            country: None,
+            proxy_category: None,
+        }
+    }
+
+    #[test]
+    fn test_build_paths_direct_only() {
+        let paths = build_paths(&[], true);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, "direct");
+        assert!(paths[0].1.is_none());
+    }
+
+    #[test]
+    fn test_build_paths_no_direct() {
+        let upstreams = vec![make_upstream("proxy1:1080", "u1", "p1")];
+        let paths = build_paths(&upstreams, false);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, "upstream_0");
+        assert_eq!(paths[0].1.as_ref().unwrap().address, "proxy1:1080");
+    }
+
+    #[test]
+    fn test_build_paths_direct_plus_one_upstream() {
+        let upstreams = vec![make_upstream("proxy1:1080", "u1", "p1")];
+        let paths = build_paths(&upstreams, true);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].0, "direct");
+        assert!(paths[0].1.is_none());
+        assert_eq!(paths[1].0, "upstream_0");
+        assert_eq!(paths[1].1.as_ref().unwrap().address, "proxy1:1080");
+    }
+
+    #[test]
+    fn test_build_paths_direct_plus_multiple_upstreams() {
+        let upstreams = vec![
+            make_upstream("proxy1:1080", "u1", "p1"),
+            make_upstream("proxy2:1081", "u2", "p2"),
+            make_upstream("proxy3:1082", "u3", "p3"),
+        ];
+        let paths = build_paths(&upstreams, true);
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths[0].0, "direct");
+        assert_eq!(paths[1].0, "upstream_0");
+        assert_eq!(paths[2].0, "upstream_1");
+        assert_eq!(paths[3].0, "upstream_2");
+        assert_eq!(paths[2].1.as_ref().unwrap().address, "proxy2:1081");
+    }
+
+    #[test]
+    fn test_build_paths_empty_without_direct_still_gives_direct() {
+        let paths = build_paths(&[], false);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, "direct");
+    }
+
+    #[test]
+    fn test_build_paths_only_upstreams_no_direct() {
+        let upstreams = vec![
+            make_upstream("a:1", "ua", "pa"),
+            make_upstream("b:2", "ub", "pb"),
+        ];
+        let paths = build_paths(&upstreams, false);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].0, "upstream_0");
+        assert_eq!(paths[1].0, "upstream_1");
+    }
+
+    #[test]
+    fn test_upstream_proxy_preserves_credentials() {
+        let upstreams = vec![make_upstream(
+            "portal.anyip.io:1080",
+            "user_2930d5,type_residential,country_US",
+            "8198c6",
+        )];
+        let paths = build_paths(&upstreams, false);
+        let p = paths[0].1.as_ref().unwrap();
+        assert_eq!(p.address, "portal.anyip.io:1080");
+        assert_eq!(p.username, "user_2930d5,type_residential,country_US");
+        assert_eq!(p.password, "8198c6");
+    }
+
+    #[test]
+    fn test_base64_encode_decode_roundtrip() {
+        let original = b"GET /v2/ip HTTP/1.1\r\nHost: api.proxybase.xyz\r\nConnection: close\r\n\r\n";
+        let encoded = base64_encode(original);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_base64_decode_empty() {
+        assert_eq!(base64_decode(""), Some(vec![]));
+    }
+
+    #[test]
+    fn test_seller_config_path() {
+        let path = seller_config_path();
+        assert!(path.ends_with("seller_config.json"));
+    }
+
+    #[test]
+    fn test_wallet_dir() {
+        let dir = wallet_dir();
+        assert!(dir.ends_with(".proxybase"));
+    }
 }
