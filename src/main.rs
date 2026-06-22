@@ -266,22 +266,24 @@ async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct
     let _ = client.register_seller().await;
 
     let paths = build_paths(proxies, include_direct);
-    let token = client.token.as_deref().unwrap_or("").to_string();
+    let token = std::sync::Arc::new(tokio::sync::Mutex::new(
+        client.token.as_deref().unwrap_or("").to_string(),
+    ));
     let base_url = backend_url.to_string();
 
     eprintln!("[seller] Starting {} path(s): {:?}", paths.len(), paths.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
 
-    // Spawn one connection per path — each runs independently with its own reconnect loop
+    // Spawn one connection per path — each runs independently with its own reconnect loop.
+    // Token is shared via Arc<Mutex<>> so re-auth by one path benefits all.
     let mut handles = Vec::new();
     for (path_id, upstream) in paths {
-        let t = token.clone();
+        let token = token.clone();
         let url = base_url.clone();
         handles.push(tokio::spawn(async move {
-            run_single_path_loop(&url, &t, &path_id, upstream.as_ref()).await;
+            run_single_path_loop(&url, token, &path_id, upstream.as_ref()).await;
         }));
     }
 
-    // Wait for all connections (they run forever unless all fail permanently)
     for h in handles {
         let _ = h.await;
     }
@@ -734,35 +736,68 @@ fn base64_decode(encoded: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Re-authenticate with the backend and return a fresh session token.
+/// Loads the wallet from disk, signs a challenge, and saves the new token.
+async fn re_authenticate_single(backend_url: &str) -> Result<String> {
+    let wm = load_wallet()
+        .context("No wallet found. Cannot re-authenticate.")?;
+    let address = wm.address()
+        .ok_or_else(|| anyhow::anyhow!("Wallet not loaded"))?;
+
+    let client = BackendClient::new(backend_url);
+    let challenge = client.auth_challenge(address).await?;
+    let message = format!("{}:{}:{}", address, challenge.nonce, challenge.timestamp);
+    let signature = wm.sign(message.as_bytes())?;
+    let sig_hex = hex::encode(&signature);
+    let public_key_hex = wm.public_key_hex()
+        .ok_or_else(|| anyhow::anyhow!("Cannot get public key"))?;
+
+    let auth = client.auth_verify(&public_key_hex, &challenge.nonce, &challenge.timestamp, &sig_hex).await?;
+    BackendClient::save_token(&auth.session_token);
+    Ok(auth.session_token)
+}
+
 /// Single-path WebSocket connection loop. Handles one path (direct or one upstream).
 /// Reconnects with exponential backoff. Sends auth token + path_info on each connect.
+/// On token expiry, re-authenticates and updates the shared token.
 async fn run_single_path_loop(
     backend_url: &str,
-    token: &str,
+    token: std::sync::Arc<tokio::sync::Mutex<String>>,
     path_id: &str,
     upstream: Option<&UpstreamProxy>,
 ) {
-    let ws_url = format!(
-        "{}/v2/ws/seller?token={}",
-        backend_url.replace("https://", "wss://").replace("http://", "ws://"),
-        token
-    );
-
     let upstream = upstream.cloned();
     let path_id = path_id.to_string();
     let mut backoff_secs = 1u64;
 
     loop {
-        eprintln!("[{}] Connecting to {} (backoff={}s)...", path_id, ws_url, backoff_secs);
-        match try_single_path_connection(&ws_url, token, &path_id, upstream.as_ref()).await {
+        let current_token = token.lock().await.clone();
+        let ws_url = format!(
+            "{}/v2/ws/seller?token={}",
+            backend_url.replace("https://", "wss://").replace("http://", "ws://"),
+            current_token
+        );
+
+        eprintln!("[{}] Connecting (backoff={}s)...", path_id, backoff_secs);
+        match try_single_path_connection(&ws_url, &current_token, &path_id, upstream.as_ref()).await {
             Ok(()) => {
                 backoff_secs = 1;
                 eprintln!("[{}] Disconnected. Reconnecting...", path_id);
             }
             Err(e) if e.to_string().contains("AUTH_EXPIRED") => {
-                eprintln!("[{}] Session token expired. Cannot re-auth in single-path mode.", path_id);
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(60);
+                eprintln!("[{}] Session token expired. Re-authenticating...", path_id);
+                match re_authenticate_single(backend_url).await {
+                    Ok(new_token) => {
+                        *token.lock().await = new_token;
+                        eprintln!("[{}] Re-authenticated successfully.", path_id);
+                        backoff_secs = 1;
+                    }
+                    Err(auth_err) => {
+                        eprintln!("[{}] Re-auth failed: {}. Retrying in {}s...", path_id, auth_err, backoff_secs);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(60);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("[{}] Connection failed: {}. Retrying in {}s...", path_id, e, backoff_secs);
