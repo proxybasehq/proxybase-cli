@@ -1438,7 +1438,7 @@ async fn main() -> Result<()> {
                         println!("  Password: {}", token);
                         println!("");
                         println!("Example:");
-                        println!("  curl --socks5 127.0.0.1:1082 --proxy-user {}:{} https://httpbin.org/ip", sid, token);
+                        println!("  curl --socks5 127.0.0.1:1082 --proxy-user {}:{} http://api.proxybase.xyz/v2/ip", sid, token);
                     }
                 }
                 MarketCmd::Close { session_id } => {
