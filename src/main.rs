@@ -671,10 +671,15 @@ async fn run_stream_relay(
         }
     };
 
-    // TCP reads → WS relay_response
+    // Race TCP→WS and WS→TCP via tokio::select! so that when EITHER
+    // direction finishes (TCP EOF or WS channel closed), the other is
+    // immediately canceled and both tcp_r + tcp_w are dropped.
+    // This prevents CLOSE_WAIT leaks: previously the write half was held
+    // indefinitely waiting on tcp_rx.recv() while the read half was already
+    // closed, leaking file descriptors until "Too many open files".
     let tx2 = relay_tx.clone();
     let sid2 = sid.clone();
-    let tcp_to_ws = tokio::spawn(async move {
+    let tcp_to_ws = async {
         let mut buf = vec![0u8; 8192];
         loop {
             match tokio::io::AsyncReadExt::read(&mut tcp_r, &mut buf).await {
@@ -689,16 +694,21 @@ async fn run_stream_relay(
                 Err(e) => { eprintln!("[RELAY {}] Read error: {}", sid2, e); break; }
             }
         }
-    });
+    };
 
-    // WS relay_data → TCP writes
-    while let Some(data) = tcp_rx.recv().await {
-        if tokio::io::AsyncWriteExt::write_all(&mut tcp_w, &data).await.is_err() {
-            eprintln!("[RELAY {}] Write failed", sid);
-            break;
+    let ws_to_tcp = async {
+        while let Some(data) = tcp_rx.recv().await {
+            if tokio::io::AsyncWriteExt::write_all(&mut tcp_w, &data).await.is_err() {
+                eprintln!("[RELAY {}] Write failed", sid);
+                break;
+            }
         }
+    };
+
+    tokio::select! {
+        _ = tcp_to_ws => {}
+        _ = ws_to_tcp => {}
     }
-    tcp_to_ws.abort();
     eprintln!("[RELAY {}] Closed", sid);
 }
 
@@ -1583,5 +1593,166 @@ mod tests {
     fn test_wallet_dir() {
         let dir = wallet_dir();
         assert!(dir.ends_with(".proxybase"));
+    }
+
+    // ── Relay loop tests (CLOSE_WAIT regression) ──
+
+    /// Core relay loop extracted for testing. Races TCP↔WS directions.
+    /// Returns when either direction completes. Both tcp_r + tcp_w are dropped
+    /// on return — no CLOSE_WAIT.
+    async fn relay_loop(
+        mut tcp_r: impl tokio::io::AsyncRead + Unpin,
+        mut tcp_w: impl tokio::io::AsyncWrite + Unpin,
+        relay_tx: &tokio::sync::mpsc::UnboundedSender<Message>,
+        mut tcp_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        sid: &str,
+    ) {
+        let tx2 = relay_tx.clone();
+        let sid2 = sid.to_string();
+        let tcp_to_ws = async {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut tcp_r, &mut buf).await {
+                    Ok(0) => { eprintln!("[RELAY {}] TCP closed", sid2); break; }
+                    Ok(n) => {
+                        let enc = base64_encode(&buf[..n]);
+                        let m = serde_json::json!({"type":"relay_response","session_id":&sid2,"data":enc});
+                        if tx2.send(Message::Text(serde_json::to_string(&m).unwrap_or_default())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => { eprintln!("[RELAY {}] Read error: {}", sid2, e); break; }
+                }
+            }
+        };
+
+        let sid3 = sid.to_string();
+        let ws_to_tcp = async {
+            while let Some(data) = tcp_rx.recv().await {
+                if tokio::io::AsyncWriteExt::write_all(&mut tcp_w, &data).await.is_err() {
+                    eprintln!("[RELAY {}] Write failed", sid3);
+                    break;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = tcp_to_ws => {}
+            _ = ws_to_tcp => {}
+        }
+        eprintln!("[RELAY {}] Closed", sid);
+    }
+
+    /// TCP EOF causes relay to exit — no hang, no CLOSE_WAIT.
+    /// Uses a local TCP listener so EOF behavior matches production exactly.
+    #[tokio::test]
+    async fn test_relay_tcp_eof_exits_cleanly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (_tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let handle = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (client_r, client_w) = tokio::io::split(stream);
+            relay_loop(client_r, client_w, &relay_tx, tcp_rx, "test-eof").await;
+        });
+
+        // Accept and immediately close → client sees RST/EOF
+        let (accepted, _) = listener.accept().await.unwrap();
+        drop(accepted); // close server side → client sees EOF
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("relay must not hang on TCP EOF")
+            .expect("relay must not panic");
+
+        assert!(relay_rx.recv().await.is_none());
+    }
+
+    /// Dropping tcp_tx (closing WS→TCP channel) causes relay to exit.
+    #[tokio::test]
+    async fn test_relay_channel_close_exits_cleanly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let handle = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (client_r, client_w) = tokio::io::split(stream);
+            relay_loop(client_r, client_w, &relay_tx, tcp_rx, "test-channel").await;
+        });
+
+        // Accept connection but don't close it
+        let _accepted = listener.accept().await.unwrap();
+        // Close the WS→TCP channel → ws_to_tcp exits → select fires
+        drop(tcp_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("relay must not hang on channel close")
+            .expect("relay must not panic");
+
+        assert!(relay_rx.recv().await.is_none());
+    }
+
+    /// Data sent through tcp_tx arrives at the accepted TCP stream.
+    #[tokio::test]
+    async fn test_relay_data_flows_to_tcp() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (relay_tx, _relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let handle = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (client_r, client_w) = tokio::io::split(stream);
+            relay_loop(client_r, client_w, &relay_tx, tcp_rx, "test-data").await;
+        });
+
+        let (mut accepted, _) = listener.accept().await.unwrap();
+
+        tcp_tx.send(b"Hello, TCP!".to_vec()).unwrap();
+        drop(tcp_tx); // close channel so relay exits
+
+        let mut buf = vec![0u8; 64];
+        let n = tokio::io::AsyncReadExt::read(&mut accepted, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"Hello, TCP!");
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("relay hang")
+            .expect("relay panic");
+    }
+
+    /// Both directions close simultaneously — relay must not deadlock.
+    #[tokio::test]
+    async fn test_relay_both_directions_close_together() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let handle = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (client_r, client_w) = tokio::io::split(stream);
+            relay_loop(client_r, client_w, &relay_tx, tcp_rx, "test-both").await;
+        });
+
+        let (accepted, _) = listener.accept().await.unwrap();
+        drop(accepted); // close TCP → tcp_to_ws sees EOF
+        drop(tcp_tx);   // close channel → ws_to_tcp sees None
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("relay must not deadlock")
+            .expect("relay must not panic");
+
+        assert!(relay_rx.recv().await.is_none());
     }
 }
