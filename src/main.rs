@@ -857,7 +857,7 @@ async fn try_single_path_connection(
 
     let upstream = upstream.cloned();
     let mut ping_tick = interval(Duration::from_secs(30));
-    let mut heartbeat_tick = interval(Duration::from_secs(30));
+    let mut heartbeat_tick = interval(Duration::from_secs(15));
 
     loop {
         tokio::select! {
@@ -894,6 +894,12 @@ async fn try_single_path_connection(
                                     let thost = p.get("target_host").and_then(|v| v.as_str()).map(|s| s.to_string());
                                     let dest = thost.unwrap_or_else(|| tip.clone());
                                     eprintln!("[{}] STREAM {} → {}:{} (direct_ip={})", path_id, sid, dest, tport, tip);
+
+                                    // F2: ACK the command
+                                    if let Some(seq) = p.get("seq").and_then(|v| v.as_u64()) {
+                                        let ack = serde_json::json!({"type": "cmd_ack", "seq": seq});
+                                        let _ = relay_tx.send(Message::Text(serde_json::to_string(&ack).unwrap_or_default()));
+                                    }
 
                                     let streams = active.clone();
                                     let tx = relay_tx.clone();
@@ -1019,7 +1025,7 @@ async fn try_seller_connection(
     });
 
     let mut ping_tick = interval(Duration::from_secs(30));
-    let mut heartbeat_tick = interval(Duration::from_secs(30));
+    let mut heartbeat_tick = interval(Duration::from_secs(15));
 
     loop {
         tokio::select! {
