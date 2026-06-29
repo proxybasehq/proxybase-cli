@@ -857,14 +857,14 @@ async fn try_single_path_connection(
 
     let upstream = upstream.cloned();
     let mut ping_tick = interval(Duration::from_secs(30));
-    let mut heartbeat_tick = interval(Duration::from_secs(60));
-    let mut stream_count: u32 = 0;
+    let mut heartbeat_tick = interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
             _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
             _ = heartbeat_tick.tick() => {
-                let hb = serde_json::json!({"type":"heartbeat","active_streams":stream_count,"version":"0.1.0","conn_id":conn_id});
+                let current_streams = active.lock().await.len() as u32;
+                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":"0.1.0","conn_id":conn_id});
                 let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
             }
             msg = ws_stream.next() => {
@@ -898,7 +898,6 @@ async fn try_single_path_connection(
                                     let streams = active.clone();
                                     let tx = relay_tx.clone();
                                     let up = upstream.clone();
-                                    stream_count += 1;
 
                                     let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                                     streams.lock().await.insert(sid.clone(), tcp_tx);
@@ -1020,14 +1019,14 @@ async fn try_seller_connection(
     });
 
     let mut ping_tick = interval(Duration::from_secs(30));
-    let mut heartbeat_tick = interval(Duration::from_secs(60));
-    let mut stream_count: u32 = 0;
+    let mut heartbeat_tick = interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
             _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
             _ = heartbeat_tick.tick() => {
-                let hb = serde_json::json!({"type":"heartbeat","active_streams":stream_count,"version":"0.1.0","conn_id":conn_id});
+                let current_streams = active.lock().await.len() as u32;
+                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":"0.1.0","conn_id":conn_id});
                 let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
             }
             msg = ws_stream.next() => {
@@ -1071,9 +1070,8 @@ async fn try_seller_connection(
                                         h % pool.len()
                                     });
                                     let up = pool[idx].clone();
-                                    stream_count += 1;
 
-                                    let (tcp_tx, mut tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                                    let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                                     streams.lock().await.insert(sid.clone(), tcp_tx);
 
                                     tokio::spawn(async move {
