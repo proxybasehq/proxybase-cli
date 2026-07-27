@@ -36,8 +36,14 @@ jobs:
           repository: proxybasehq/libproxybase
           path: libproxybase
 
-      - name: Link libproxybase
+      - name: Link libproxybase (Unix)
+        if: runner.os != 'Windows'
         run: ln -s "$PWD/libproxybase" "$GITHUB_WORKSPACE/../libproxybase"
+
+      - name: Link libproxybase (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: mklink /J ..\libproxybase libproxybase
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
