@@ -31,8 +31,17 @@ jobs:
             exe_suffix: ""
 
     steps:
-      - name: Checkout
+      - name: Checkout proxybase-cli
         uses: actions/checkout@v4
+
+      - name: Checkout libproxybase
+        uses: actions/checkout@v4
+        with:
+          repository: proxybasehq/libproxybase
+          path: libproxybase
+
+      - name: Link libproxybase
+        run: ln -s "$PWD/libproxybase" "$GITHUB_WORKSPACE/../libproxybase"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
