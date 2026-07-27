@@ -9,13 +9,13 @@ homepage = "https://proxybase.xyz"
 rust-version = "1.78"
 
 [dependencies]
-libproxybase = { version = "0.4.0" }
+libproxybase = { path = "../libproxybase" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 dirs = "5"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
