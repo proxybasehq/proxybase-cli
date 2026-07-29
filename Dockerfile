@@ -33,6 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -g 1000 proxybase && \
     useradd -u 1000 -g proxybase -s /bin/bash -m proxybase
 
+RUN mkdir -p /home/proxybase/.proxybase/wallet && \
+    chown -R proxybase:proxybase /home/proxybase/.proxybase
+
 WORKDIR /home/proxybase
 
 COPY --from=builder /usr/src/app/proxybase-cli/target/release/proxybase-cli /usr/local/bin/proxybase-cli
