@@ -870,7 +870,10 @@ async fn try_single_path_connection(
     let upstream = upstream.cloned();
     let mut ping_tick = interval(Duration::from_secs(30));
     let mut heartbeat_tick = interval(Duration::from_secs(15));
-    let mut watchdog = interval(Duration::from_secs(90));
+    let mut watchdog = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(90),
+        Duration::from_secs(90),
+    );
     const MAX_STREAMS: usize = 100;
 
     loop {
