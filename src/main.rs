@@ -1149,6 +1149,7 @@ async fn authenticate(client: &BackendClient, wm: &libproxybase::WalletManager) 
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     let client = BackendClient::new(&cli.backend);
 
