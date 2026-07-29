@@ -36,7 +36,11 @@ RUN groupadd -g 1000 proxybase && \
 WORKDIR /home/proxybase
 
 COPY --from=builder /usr/src/app/proxybase-cli/target/release/proxybase-cli /usr/local/bin/proxybase-cli
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# Make the entrypoint script executable on all archs (COPY preserves host perms)
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 USER proxybase
 
-ENTRYPOINT ["/usr/local/bin/proxybase-cli"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
