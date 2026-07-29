@@ -19,13 +19,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 dirs = "5"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 url = "2"
 fast-socks5 = { git = "https://github.com/proxybasehq/fast-sock5" }
 uuid = { version = "1", features = ["v4"] }
 daemon-kit = "0.1.4"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+webpki-roots = "0.26"
 
 [profile.release]
 lto = true

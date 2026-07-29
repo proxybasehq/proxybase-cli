@@ -650,12 +650,18 @@ async fn run_stream_relay(
         }
         None => {
             eprintln!("[RELAY {}] Direct connect (no upstream proxy)", sid);
-            match tokio::net::TcpStream::connect(format!("{}:{}", target_ip, target_port)).await {
-                Ok(tcp) => {
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                tokio::net::TcpStream::connect(format!("{}:{}", target_ip, target_port)),
+            )
+            .await
+            {
+                Ok(Ok(tcp)) => {
                     let (r, w) = tokio::io::split(tcp);
                     Ok((Box::new(r), Box::new(w)))
                 }
-                Err(e) => Err(anyhow::anyhow!("TCP connect failed: {}", e)),
+                Ok(Err(e)) => Err(anyhow::anyhow!("TCP connect failed: {}", e)),
+                Err(_) => Err(anyhow::anyhow!("TCP connect timed out after 10s")),
             }
         }
     };
@@ -794,7 +800,7 @@ async fn run_single_path_loop(
                 backoff_secs = 1;
                 eprintln!("[{}] Disconnected. Reconnecting...", path_id);
             }
-            Err(e) if e.to_string().contains("AUTH_EXPIRED") => {
+            Err(e) if e.to_string().contains("AUTH_EXPIRED") || e.to_string().contains("401") => {
                 eprintln!("[{}] Session token expired. Re-authenticating...", path_id);
                 match re_authenticate_single(backend_url).await {
                     Ok(new_token) => {
@@ -825,7 +831,13 @@ async fn try_single_path_connection(
     path_id: &str,
     upstream: Option<&UpstreamProxy>,
 ) -> Result<()> {
-    let (ws, _resp) = connect_async(ws_url).await.context("Failed to connect WebSocket")?;
+    let (ws, _resp) = tokio::time::timeout(
+        tokio::time::Duration::from_secs(15),
+        connect_async(ws_url),
+    )
+    .await
+    .context("connect_async timed out after 15s")?
+    .context("Failed to connect WebSocket")?;
     let conn_id = uuid::Uuid::new_v4().to_string();
     eprintln!("[{}] Connected (conn={}).", path_id, &conn_id[..8]);
 
@@ -858,9 +870,15 @@ async fn try_single_path_connection(
     let upstream = upstream.cloned();
     let mut ping_tick = interval(Duration::from_secs(30));
     let mut heartbeat_tick = interval(Duration::from_secs(15));
+    let mut watchdog = interval(Duration::from_secs(90));
+    const MAX_STREAMS: usize = 100;
 
     loop {
         tokio::select! {
+            _ = watchdog.tick() => {
+                relay_drain.abort();
+                return Err(anyhow::anyhow!("Connection watchdog: no message in 90s"));
+            }
             _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
             _ = heartbeat_tick.tick() => {
                 let current_streams = active.lock().await.len() as u32;
@@ -868,6 +886,7 @@ async fn try_single_path_connection(
                 let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
             }
             msg = ws_stream.next() => {
+                watchdog.reset();
                 match msg {
                     Some(Ok(Message::Ping(d))) => { let _ = relay_tx.send(Message::Pong(d)); }
                     Some(Ok(Message::Pong(_))) => {}
@@ -887,7 +906,12 @@ async fn try_single_path_connection(
                                         }
                                     }
                                 }
+                                Some("stream_close") => {
+                                    let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    active.lock().await.remove(sid);
+                                }
                                 Some("stream_open") => {
+                                    if active.lock().await.len() >= MAX_STREAMS { continue; }
                                     let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
                                     let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
                                     let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
@@ -956,7 +980,7 @@ async fn run_seller_ws_loop(
                 backoff_secs = 1;
                 eprintln!("Disconnected. Reconnecting...");
             }
-            Err(e) if e.to_string().contains("AUTH_EXPIRED") => {
+            Err(e) if e.to_string().contains("AUTH_EXPIRED") || e.to_string().contains("401") => {
                 eprintln!("Session token expired or invalid. Re-authenticating...");
                 match re_authenticate(&mut client).await {
                     Ok(()) => {
@@ -1003,7 +1027,13 @@ async fn try_seller_connection(
     token: &str,
     pool: std::sync::Arc<Vec<Option<UpstreamProxy>>>,
 ) -> Result<()> {
-    let (ws, _resp) = connect_async(ws_url).await.context("Failed to connect WebSocket")?;
+    let (ws, _resp) = tokio::time::timeout(
+        tokio::time::Duration::from_secs(15),
+        connect_async(ws_url),
+    )
+    .await
+    .context("connect_async timed out after 15s")?
+    .context("Failed to connect WebSocket")?;
     let conn_id = uuid::Uuid::new_v4().to_string();
     println!("Connected (conn={}). Press Ctrl+C to stop.", &conn_id[..8]);
 
