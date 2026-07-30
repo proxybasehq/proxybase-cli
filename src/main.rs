@@ -711,9 +711,14 @@ async fn run_stream_relay(
         }
     };
 
-    tokio::select! {
-        _ = tcp_to_ws => {}
-        _ = ws_to_tcp => {}
+    let relay_task = async {
+        tokio::select! {
+            _ = tcp_to_ws => {}
+            _ = ws_to_tcp => {}
+        }
+    };
+    if tokio::time::timeout(tokio::time::Duration::from_secs(60), relay_task).await.is_err() {
+        eprintln!("[RELAY {}] Inactivity timeout — closing", sid);
     }
     eprintln!("[RELAY {}] Closed", sid);
 }
@@ -1693,9 +1698,14 @@ mod tests {
             }
         };
 
-        tokio::select! {
-            _ = tcp_to_ws => {}
-            _ = ws_to_tcp => {}
+        let relay_task = async {
+            tokio::select! {
+                _ = tcp_to_ws => {}
+                _ = ws_to_tcp => {}
+            }
+        };
+        if tokio::time::timeout(tokio::time::Duration::from_secs(60), relay_task).await.is_err() {
+            eprintln!("[RELAY {}] Inactivity timeout — closing", sid);
         }
         eprintln!("[RELAY {}] Closed", sid);
     }
