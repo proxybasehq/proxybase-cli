@@ -1142,7 +1142,26 @@ fn wallet_dir() -> std::path::PathBuf {
 
 fn load_wallet() -> Result<libproxybase::WalletManager> {
     let mut wm = libproxybase::WalletManager::new(wallet_dir())?;
-    wm.load("")?;
+
+    let env_pw = std::env::var("PROXYBASE_PASSWORD").unwrap_or_default();
+    let passwords_to_try: Vec<&str> = if env_pw.is_empty() {
+        vec![""]
+    } else {
+        vec![&env_pw, ""]
+    };
+
+    let mut loaded = false;
+    for pw in &passwords_to_try {
+        if wm.load(pw).is_ok() {
+            loaded = true;
+            break;
+        }
+    }
+    if !loaded {
+        anyhow::bail!(
+            "Failed to load wallet. If password-protected, set PROXYBASE_PASSWORD env var."
+        );
+    }
     Ok(wm)
 }
 
