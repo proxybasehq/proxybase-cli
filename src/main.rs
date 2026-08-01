@@ -633,19 +633,28 @@ async fn run_stream_relay(
     )> = match upstream {
         Some(proxy) => {
             eprintln!("[RELAY {}] Using upstream proxy {} (user={})", sid, proxy.address, proxy.username);
-            match fast_socks5::client::Socks5Stream::connect_with_password(
-                &proxy.address,
-                target_dest.to_string(),
-                target_port,
-                proxy.username.clone(),
-                proxy.password.clone(),
-                fast_socks5::client::Config::default(),
-            ).await {
-                Ok(stream) => {
+            // fast-socks5 has no built-in connect timeout (Config::default()
+            // leaves connect_timeout as None), so a dead/stalling upstream
+            // would hold its socket FD forever. Bound the whole handshake.
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                fast_socks5::client::Socks5Stream::connect_with_password(
+                    &proxy.address,
+                    target_dest.to_string(),
+                    target_port,
+                    proxy.username.clone(),
+                    proxy.password.clone(),
+                    fast_socks5::client::Config::default(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
                     let (r, w) = tokio::io::split(stream);
                     Ok((Box::new(r), Box::new(w)))
                 }
-                Err(e) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
+                Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
+                Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
             }
         }
         None => {
@@ -685,40 +694,73 @@ async fn run_stream_relay(
     // closed, leaking file descriptors until "Too many open files".
     let tx2 = relay_tx.clone();
     let sid2 = sid.clone();
-    let tcp_to_ws = async {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut tcp_r, &mut buf).await {
-                Ok(0) => { eprintln!("[RELAY {}] TCP closed", sid2); break; }
-                Ok(n) => {
-                    let enc = base64_encode(&buf[..n]);
-                    let m = serde_json::json!({"type":"relay_response","session_id":&sid2,"data":enc});
-                    if tx2.send(Message::Text(serde_json::to_string(&m).unwrap_or_default())).is_err() {
-                        break;
+    let sid3 = sid.clone();
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+    // True inactivity timeout: traffic in either direction resets the clock.
+    // (A hard cap would silently kill long-lived buyer sessions after 60s; an
+    // idle timeout still closes abandoned probe/keep-alive connections so FDs
+    // cannot accumulate.)
+    let deadline = std::sync::Arc::new(std::sync::Mutex::new(
+        tokio::time::Instant::now() + IDLE_TIMEOUT,
+    ));
+
+    let tcp_to_ws = {
+        let deadline = deadline.clone();
+        async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut tcp_r, &mut buf).await {
+                    Ok(0) => { eprintln!("[RELAY {}] TCP closed", sid2); break; }
+                    Ok(n) => {
+                        *deadline.lock().unwrap() = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                        let enc = base64_encode(&buf[..n]);
+                        let m = serde_json::json!({"type":"relay_response","session_id":&sid2,"data":enc});
+                        if tx2.send(Message::Text(serde_json::to_string(&m).unwrap_or_default())).is_err() {
+                            break;
+                        }
                     }
+                    Err(e) => { eprintln!("[RELAY {}] Read error: {}", sid2, e); break; }
                 }
-                Err(e) => { eprintln!("[RELAY {}] Read error: {}", sid2, e); break; }
             }
         }
     };
 
-    let ws_to_tcp = async {
-        while let Some(data) = tcp_rx.recv().await {
-            if tokio::io::AsyncWriteExt::write_all(&mut tcp_w, &data).await.is_err() {
-                eprintln!("[RELAY {}] Write failed", sid);
-                break;
+    let ws_to_tcp = {
+        let deadline = deadline.clone();
+        let sid = sid3;
+        async move {
+            while let Some(data) = tcp_rx.recv().await {
+                *deadline.lock().unwrap() = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                if tokio::io::AsyncWriteExt::write_all(&mut tcp_w, &data).await.is_err() {
+                    eprintln!("[RELAY {}] Write failed", sid);
+                    break;
+                }
             }
         }
     };
 
-    let relay_task = async {
-        tokio::select! {
-            _ = tcp_to_ws => {}
-            _ = ws_to_tcp => {}
+    // Sleep until the current idle deadline, re-checking it on each wake so
+    // any traffic keeps the relay alive indefinitely.
+    let idle_waiter = {
+        let deadline = deadline.clone();
+        async move {
+            loop {
+                let next = *deadline.lock().unwrap();
+                if tokio::time::Instant::now() >= next {
+                    break;
+                }
+                tokio::time::sleep_until(next).await;
+            }
         }
     };
-    if tokio::time::timeout(tokio::time::Duration::from_secs(60), relay_task).await.is_err() {
-        eprintln!("[RELAY {}] Inactivity timeout — closing", sid);
+
+    tokio::select! {
+        _ = tcp_to_ws => {}
+        _ = ws_to_tcp => {}
+        _ = idle_waiter => {
+            eprintln!("[RELAY {}] Idle timeout — closing", sid);
+        }
     }
     eprintln!("[RELAY {}] Closed", sid);
 }
@@ -778,6 +820,17 @@ async fn re_authenticate_single(backend_url: &str) -> Result<String> {
     Ok(auth.session_token)
 }
 
+/// Exponential backoff with ±20% jitter so multiple sellers/daemons do not
+/// reconnect in lockstep after an outage.
+fn jittered_backoff(secs: u64) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let factor = 0.8 + (nanos % 401) as f64 / 1000.0; // 0.8 ..= 1.2
+    Duration::from_secs_f64(secs as f64 * factor)
+}
+
 /// Single-path WebSocket connection loop. Handles one path (direct or one upstream).
 /// Reconnects with exponential backoff. Sends auth token + path_info on each connect.
 /// On token expiry, re-authenticates and updates the shared token.
@@ -793,10 +846,14 @@ async fn run_single_path_loop(
 
     loop {
         let current_token = token.lock().await.clone();
+        // Percent-encode the token so query-string special characters can
+        // never corrupt the URL (tokens are hex today, but be safe).
+        let encoded_token: String =
+            url::form_urlencoded::byte_serialize(current_token.as_bytes()).collect();
         let ws_url = format!(
             "{}/v2/ws/seller?token={}",
             backend_url.replace("https://", "wss://").replace("http://", "ws://"),
-            current_token
+            encoded_token
         );
 
         eprintln!("[{}] Connecting (backoff={}s)...", path_id, backoff_secs);
@@ -815,14 +872,14 @@ async fn run_single_path_loop(
                     }
                     Err(auth_err) => {
                         eprintln!("[{}] Re-auth failed: {}. Retrying in {}s...", path_id, auth_err, backoff_secs);
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        tokio::time::sleep(jittered_backoff(backoff_secs)).await;
                         backoff_secs = (backoff_secs * 2).min(60);
                     }
                 }
             }
             Err(e) => {
                 eprintln!("[{}] Connection failed: {}. Retrying in {}s...", path_id, e, backoff_secs);
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                tokio::time::sleep(jittered_backoff(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(60);
             }
         }
@@ -872,6 +929,10 @@ async fn try_single_path_connection(
         }
     });
 
+    // Handles to every relay task spawned below; aborted together with the
+    // path connection so a hung connect cannot leak sockets between reconnects.
+    let mut relay_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     let upstream = upstream.cloned();
     let mut ping_tick = interval(Duration::from_secs(30));
     let mut heartbeat_tick = interval(Duration::from_secs(15));
@@ -885,6 +946,7 @@ async fn try_single_path_connection(
         tokio::select! {
             _ = watchdog.tick() => {
                 relay_drain.abort();
+                for h in &relay_tasks { h.abort(); }
                 return Err(anyhow::anyhow!("Connection watchdog: no message in 90s"));
             }
             _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
@@ -901,6 +963,8 @@ async fn try_single_path_connection(
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(p) = serde_json::from_str::<serde_json::Value>(&text) {
                             if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
+                                relay_drain.abort();
+                                for h in &relay_tasks { h.abort(); }
                                 return Err(anyhow::anyhow!("AUTH_EXPIRED"));
                             }
                             match p.get("type").and_then(|v| v.as_str()) {
@@ -940,10 +1004,11 @@ async fn try_single_path_connection(
                                     let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                                     streams.lock().await.insert(sid.clone(), tcp_tx);
 
-                                    tokio::spawn(async move {
+                                    let handle = tokio::spawn(async move {
                                         run_stream_relay(&dest, &tip, tport, up.as_ref(), &tx, tcp_rx, &sid).await;
                                         streams.lock().await.remove(&sid);
                                     });
+                                    relay_tasks.push(handle);
                                 }
                                 _ => {}
                             }
@@ -957,6 +1022,7 @@ async fn try_single_path_connection(
         }
     }
     relay_drain.abort();
+    for h in &relay_tasks { h.abort(); }
     Ok(())
 }
 
