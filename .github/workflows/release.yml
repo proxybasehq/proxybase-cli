@@ -82,6 +82,9 @@ jobs:
             tar -C "$(dirname "$BIN_PATH")" -czf "dist/${BIN_NAME}-${{ matrix.target }}.tar.gz" "$(basename "$BIN_PATH")"
           fi
 
+          # Raw binary for the self-updater (name must match update.rs asset_for)
+          cp "$BIN_PATH" "dist/${BIN_NAME}-${{ matrix.target }}${{ matrix.exe_suffix }}"
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
@@ -100,6 +103,14 @@ jobs:
           path: dist
           pattern: dist-*
           merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum proxybase-cli-x86_64-unknown-linux-gnu \
+                    proxybase-cli-x86_64-pc-windows-msvc.exe \
+                    proxybase-cli-aarch64-apple-darwin > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

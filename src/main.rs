@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+
+mod update;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
@@ -59,6 +61,12 @@ enum Commands {
     Health,
     /// Print version
     Version,
+    /// Check for or install the latest release
+    Update {
+        /// Only check for a new version, don't download
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -952,7 +960,7 @@ async fn try_single_path_connection(
             _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
             _ = heartbeat_tick.tick() => {
                 let current_streams = active.lock().await.len() as u32;
-                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":"0.1.0","conn_id":conn_id});
+                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":env!("CARGO_PKG_VERSION"),"conn_id":conn_id});
                 let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
             }
             msg = ws_stream.next() => {
@@ -1138,7 +1146,7 @@ async fn try_seller_connection(
             _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
             _ = heartbeat_tick.tick() => {
                 let current_streams = active.lock().await.len() as u32;
-                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":"0.1.0","conn_id":conn_id});
+                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":env!("CARGO_PKG_VERSION"),"conn_id":conn_id});
                 let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
             }
             msg = ws_stream.next() => {
@@ -1209,7 +1217,7 @@ async fn try_seller_connection(
     Ok(())
 }
 
-fn wallet_dir() -> std::path::PathBuf {
+pub(crate) fn wallet_dir() -> std::path::PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
         .join(".proxybase")
@@ -1276,8 +1284,12 @@ async fn authenticate(client: &BackendClient, wm: &libproxybase::WalletManager) 
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    update::cleanup_stale();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
+    if !matches!(cli.command, Commands::Update { .. }) {
+        update::check_and_notify().await;
+    }
     let client = BackendClient::new(&cli.backend);
 
     match cli.command {
@@ -1605,6 +1617,10 @@ async fn main() -> Result<()> {
 
         Commands::Version => {
             println!("proxybase-cli v{}", env!("CARGO_PKG_VERSION"));
+        }
+
+        Commands::Update { check } => {
+            update::run_update(check).await?;
         }
     }
 

@@ -27,6 +27,8 @@ uuid = { version = "1", features = ["v4"] }
 daemon-kit = "0.1.4"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 webpki-roots = "0.26"
+semver = "1"
+sha2 = "0.10"
 
 [profile.release]
 lto = true
