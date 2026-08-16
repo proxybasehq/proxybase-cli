@@ -96,6 +96,9 @@ enum SellerCmd {
         /// Disable direct (own bandwidth). Only use --upstream proxies.
         #[arg(long)]
         no_direct: bool,
+        /// Run as a volunteer node (donate bandwidth without earnings).
+        #[arg(long)]
+        volunteer: bool,
         /// Run in foreground (don't daemonize). Used internally by the service manager.
         #[arg(long)]
         foreground: bool,
@@ -203,6 +206,10 @@ fn parse_upstream_metadata(username: &str) -> (Option<String>, Option<String>) {
 struct SellerConfig {
     upstream_proxies: Vec<UpstreamProxyConfig>,
     no_direct: bool,
+    /// Volunteer mode: donate bandwidth without earnings.
+    /// Defaulted so configs written by older CLI versions still load.
+    #[serde(default)]
+    volunteer: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -265,13 +272,17 @@ fn build_paths(upstreams: &[UpstreamProxy], include_direct: bool) -> Vec<(String
 
 /// Shared async seller entry point. Opens one WebSocket connection per path
 /// (direct + each upstream) so each path is independently classified and matched.
-async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct: bool) {
+async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct: bool, volunteer: bool) {
     let client = BackendClient::new(backend_url);
     if !client.is_authenticated() {
         eprintln!("[seller] Not authenticated. Run 'proxybase-cli login' first.");
         return;
     }
-    let _ = client.register_seller().await;
+    let node_type = if volunteer { "volunteer" } else { "standard" };
+    let _ = client.register_seller(node_type).await;
+    if volunteer {
+        eprintln!("[seller] Volunteer mode: donating bandwidth without earnings.");
+    }
 
     let paths = build_paths(proxies, include_direct);
     let token = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -513,11 +524,12 @@ impl BackendClient {
 
     // --- Seller ---
 
-    async fn register_seller(&self) -> Result<serde_json::Value> {
+    async fn register_seller(&self, node_type: &str) -> Result<serde_json::Value> {
         let resp = self
             .http
             .post(format!("{}/v2/seller/register", self.base_url))
             .header("Authorization", self.bearer())
+            .json(&serde_json::json!({ "node_type": node_type }))
             .send()
             .await?;
         Ok(resp.json().await?)
@@ -1363,7 +1375,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Not authenticated. Run 'proxybase-cli login' first.");
             }
             match cmd {
-                SellerCmd::Start { upstream_hosts, upstream_users, upstream_passes, no_direct, foreground } => {
+                SellerCmd::Start { upstream_hosts, upstream_users, upstream_passes, no_direct, volunteer, foreground } => {
                     // Build proxy list from args
                     let n = upstream_hosts.len().min(upstream_users.len()).min(upstream_passes.len());
                     let proxies: Vec<UpstreamProxy> = (0..n).map(|i| {
@@ -1380,23 +1392,37 @@ async fn main() -> Result<()> {
                         eprintln!("Warning: --upstream, --upstream-user, --upstream-pass counts differ. Using {} proxy(s).", n);
                     }
 
-                    // Save config if upstream args provided (so daemon can restart without args)
+                    // Save config if upstream args provided (so daemon can restart without args).
+                    // Volunteer mode is also persisted so the daemon keeps donating
+                    // bandwidth after restart.
                     let has_upstream_args = !upstream_hosts.is_empty() || !upstream_users.is_empty() || !upstream_passes.is_empty();
-                    if has_upstream_args {
-                        let config = SellerConfig {
-                            upstream_proxies: proxies.iter().map(|p| UpstreamProxyConfig {
-                                address: p.address.clone(),
-                                username: p.username.clone(),
-                                password: p.password.clone(),
-                                country: p.country.clone(),
-                                proxy_category: p.proxy_category.clone(),
-                            }).collect(),
-                            no_direct,
-                        };
-                        save_seller_config(&config)?;
+                    if has_upstream_args || volunteer {
+                        if has_upstream_args {
+                            let config = SellerConfig {
+                                upstream_proxies: proxies.iter().map(|p| UpstreamProxyConfig {
+                                    address: p.address.clone(),
+                                    username: p.username.clone(),
+                                    password: p.password.clone(),
+                                    country: p.country.clone(),
+                                    proxy_category: p.proxy_category.clone(),
+                                }).collect(),
+                                no_direct,
+                                volunteer,
+                            };
+                            save_seller_config(&config)?;
+                        } else {
+                            // Volunteer-only start: keep any previously saved upstreams.
+                            let mut config = load_seller_config().unwrap_or(SellerConfig {
+                                upstream_proxies: vec![],
+                                no_direct,
+                                volunteer,
+                            });
+                            config.volunteer = volunteer;
+                            save_seller_config(&config)?;
+                        }
                     }
 
-                    let (proxies, include_direct) = if foreground {
+                    let (proxies, include_direct, volunteer_mode) = if foreground {
                         // Service manager flow: load saved config
                         let config = load_seller_config()?;
                         let p: Vec<UpstreamProxy> = config.upstream_proxies.iter().map(|u| UpstreamProxy {
@@ -1407,9 +1433,9 @@ async fn main() -> Result<()> {
                             proxy_category: u.proxy_category.clone(),
                         }).collect();
                         let include = !config.no_direct;
-                        (p, include)
+                        (p, include, config.volunteer)
                     } else {
-                        (proxies, !no_direct)
+                        (proxies, !no_direct, volunteer)
                     };
 
                     let total_paths = proxies.len() + if include_direct { 1 } else { 0 };
@@ -1417,6 +1443,9 @@ async fn main() -> Result<()> {
                         (true, 0) => println!("Selling own bandwidth (direct only)"),
                         (true, n) => println!("Selling direct + reselling via {} upstream(s) — {} total paths", n, total_paths),
                         (false, n) => println!("Reselling via {} upstream(s) only (no direct)", n),
+                    }
+                    if volunteer_mode {
+                        println!("Node Type: Volunteer (bandwidth donation — unpaid)");
                     }
 
                     if foreground {
@@ -1428,7 +1457,7 @@ async fn main() -> Result<()> {
                         let _ = std::fs::write(&pid_path, std::process::id().to_string());
 
                         // Already inside a tokio runtime — run directly.
-                        run_seller(&cli.backend, &proxies, include_direct).await;
+                        run_seller(&cli.backend, &proxies, include_direct, volunteer_mode).await;
                     } else {
                         let daemon = seller_daemon();
 
@@ -1483,8 +1512,16 @@ async fn main() -> Result<()> {
                     } else {
                         println!("Daemon:  not running");
                     }
+                    if let Ok(cfg) = load_seller_config() {
+                        println!("Node Type: {}", if cfg.volunteer { "Volunteer (Bandwidth Donation - Unpaid)" } else { "Standard" });
+                    }
                     match client.seller_status().await {
-                        Ok(status) => println!("{}", serde_json::to_string_pretty(&status)?),
+                        Ok(status) => {
+                            if let Some(node_type) = status.get("node_type").and_then(|v| v.as_str()) {
+                                println!("Backend node_type: {}", if node_type == "volunteer" { "Volunteer (Bandwidth Donation - Unpaid)" } else { "Standard" });
+                            }
+                            println!("{}", serde_json::to_string_pretty(&status)?)
+                        }
                         Err(e) => println!("Backend: unreachable ({e})"),
                     }
                 }
@@ -1683,6 +1720,25 @@ mod tests {
         assert_eq!(paths[2].0, "upstream_1");
         assert_eq!(paths[3].0, "upstream_2");
         assert_eq!(paths[2].1.as_ref().unwrap().address, "proxy2:1081");
+    }
+
+    #[test]
+    fn test_seller_config_volunteer_defaults_false_for_legacy_configs() {
+        // Configs written by CLI versions before --volunteer existed must load.
+        let legacy = r#"{"upstream_proxies":[],"no_direct":false}"#;
+        let config: SellerConfig = serde_json::from_str(legacy).expect("legacy seller config must parse");
+        assert!(!config.volunteer, "legacy configs default to non-volunteer");
+
+        let volunteer = r#"{"upstream_proxies":[],"no_direct":false,"volunteer":true}"#;
+        let config: SellerConfig = serde_json::from_str(volunteer).expect("volunteer config must parse");
+        assert!(config.volunteer);
+    }
+
+    #[test]
+    fn test_parse_upstream_metadata_unchanged() {
+        let (country, category) = parse_upstream_metadata("user_2930d5,type_residential,country_US,session_usresidential");
+        assert_eq!(country.as_deref(), Some("US"));
+        assert_eq!(category.as_deref(), Some("residential"));
     }
 
     #[test]
