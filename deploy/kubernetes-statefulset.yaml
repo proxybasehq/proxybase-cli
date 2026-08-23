@@ -1,0 +1,94 @@
+# ProxyBase HD seller fleet on Kubernetes.
+#
+# A StatefulSet gives pods stable ordinal hostnames (proxybase-seller-0,
+# proxybase-seller-1, ...). The entrypoint extracts the ordinal from the
+# hostname and derives wallet m/44'/60'/0'/0/{ordinal} from MASTER_MNEMONIC,
+# so every pod gets a distinct wallet address from one master phrase.
+#
+# Prerequisites:
+#   1. Put the real master phrase + keystore password into the Secret below
+#      (use SealedSecrets / Vault / cloud secret manager in production).
+#   2. Scale: kubectl scale statefulset proxybase-seller --replicas=100
+#
+# State is kept in a tmpfs emptyDir — signing keys and session tokens never
+# touch persistent disk. A restarted pod re-derives the identical identity.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: proxybase-master-secret
+  namespace: proxybase
+type: Opaque
+stringData:
+  # NOTE: replace with your real fleet master phrase (12/24 words).
+  master-mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+  keystore-password: "fleet-production-secure-keystore-pass"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: proxybase-seller
+  namespace: proxybase
+  labels:
+    app.kubernetes.io/name: proxybase-seller
+spec:
+  serviceName: "proxybase-seller-mesh"
+  replicas: 10 # Instant scale from 1 to 100+ nodes
+  podManagementPolicy: Parallel
+  updateStrategy:
+    # RollingUpdate updates in reverse ordinal order (9 -> 8 -> 7...).
+    # Because ordinal i must shut down before its replacement starts,
+    # dual-connection collisions on wallet A_i are impossible during upgrades.
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: proxybase-seller
+  template:
+    metadata:
+      labels:
+        app: proxybase-seller
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+      - name: node
+        image: ghcr.io/proxybasehq/proxybase-cli:latest
+        imagePullPolicy: IfNotPresent
+        # The image ENTRYPOINT (tini -> docker-entrypoint.sh) resolves the
+        # ordinal from the pod hostname and derives the HD child wallet.
+        args: ["proxybase-cli", "seller", "start", "--foreground"]
+        env:
+        - name: PROXYBASE_BACKEND
+          value: "https://api.proxybase.xyz"
+        - name: MASTER_MNEMONIC
+          valueFrom:
+            secretKeyRef:
+              name: proxybase-master-secret
+              key: master-mnemonic
+        - name: PROXYBASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: proxybase-master-secret
+              key: keystore-password
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "250m"
+            memory: "128Mi"
+        securityContext:
+          readOnlyRootFilesystem: false
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        # tmpfs: ephemeral keystores so private keys are never written to disk
+        - name: ephemeral-state
+          mountPath: /home/proxybase/.proxybase
+      volumes:
+      - name: ephemeral-state
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi

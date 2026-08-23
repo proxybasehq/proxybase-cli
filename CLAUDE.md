@@ -18,7 +18,9 @@ cargo test
 
 The entire CLI lives in a single file — `src/main.rs`. It depends on the sibling crate `libproxybase` (at `../libproxybase`) for wallet crypto: secp256k1 keypairs, BIP-39 mnemonics, and encrypted keystore storage.
 
-**Commands**: `wallet` (create/import/info), `login`, `seller` (start/stop/status/payout/install/uninstall), `buyer` (balance/deposit/transfer), `market` (countries/currencies/prices/buy/close/sessions/session-status), `health`, `version`.
+**Commands**: `wallet` (create/import/info/sweep), `login`, `seller` (start/stop/status/payout/install/uninstall), `buyer` (balance/deposit/transfer), `market` (countries/currencies/prices/buy/close/sessions/session-status), `health`, `version`.
+
+**HD wallets** (`wallet import --hd-index N` / `wallet sweep`): BIP-32/BIP-44 child derivation `m/44'/60'/0'/0/{index}` from a master mnemonic (implemented in `libproxybase/src/wallet/hd.rs`). `import` without `--hd-index` keeps the legacy raw-seed derivation — same phrase, different address, intentional. `wallet sweep` derives each child in memory, authenticates per child, reads top-level `seller_available` from `GET /v2/wallet/balance` (ledger-backed, works for offline nodes — `/v2/seller/status` only reports earnings for pool-connected nodes), and creates `POST /v2/payouts` when earnings meet `--min-threshold`; the operator's on-disk wallet/token are untouched. Full design, container env vars, and K8s/compose blueprints: `docs/HD_WALLETS.md`; deploy assets in `deploy/`. The Docker image entrypoint (`docker-entrypoint.sh`) runs in HD mode when `MASTER_MNEMONIC` is set (index from `PROXYBASE_HD_INDEX` → hostname ordinal → `cksum % 10000`), else legacy bootstrap. The image HEALTHCHECK requires backend reachability plus a live local seller process. `PROXYBASE_DIR` env overrides the state dir (`data_dir()` in main.rs).
 
 **Wallet** (`~/.proxybase/`):
 - Keyfile: `~/.proxybase/wallet/keyfile.enc` (encrypted secp256k1 signing key)
@@ -26,6 +28,10 @@ The entire CLI lives in a single file — `src/main.rs`. It depends on the sibli
 - Seller config: `~/.proxybase/seller_config.json` (upstream proxies + settings for daemon)
 - PID file: `~/.proxybase/proxybase-seller.pid` (running daemon PID)
 - Log file: `~/.proxybase/seller.log` (daemon stdout/stderr)
+
+All of the above resolve through `data_dir()`: `PROXYBASE_DIR` env var wins,
+else `$HOME/.proxybase`. The keystore password for `wallet import` comes from
+`PROXYBASE_PASSWORD` (default `""`), and `load_wallet()` tries the same order.
 
 **Auth flow**: challenge-response using ECDSA (secp256k1). Backend sends a `nonce` + `timestamp`, CLI signs `address:nonce:timestamp`, backend verifies the signature against the SEC1-encoded public key (not the derived address). Returns a session token saved to disk.
 

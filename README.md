@@ -2,6 +2,24 @@
 
 Official command-line client for ProxyBase.
 
+## HD fleet wallets
+
+Run an entire seller fleet off one master mnemonic: each node derives a
+distinct BIP-44 child wallet at `m/44'/60'/0'/0/{index}`.
+
+```bash
+# Node index 3
+proxybase-cli wallet import "<master phrase>" --hd-index 3
+proxybase-cli login
+
+# Sweep all children's earnings into one central Tempo wallet
+proxybase-cli wallet sweep "<master phrase>" --count 100 --target-tempo 0x71C...
+```
+
+Container deployment (Kubernetes StatefulSet, Docker Compose, entrypoint
+env vars, fleet sweeper cron) is documented in
+[`docs/HD_WALLETS.md`](docs/HD_WALLETS.md); manifests live in [`deploy/`](deploy/).
+
 ## Build
 
 ```bash

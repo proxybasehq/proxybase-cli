@@ -73,10 +73,38 @@ enum Commands {
 enum WalletCmd {
     /// Generate a new wallet
     Create,
-    /// Import an existing mnemonic
-    Import { phrase: String },
+    /// Import an existing mnemonic. Without --hd-index uses the legacy
+    /// raw-seed derivation; with --hd-index derives the BIP-44 child
+    /// wallet at m/44'/60'/0'/0/{index} from the master phrase.
+    Import {
+        phrase: String,
+        /// BIP-44 HD child derivation index
+        #[arg(long)]
+        hd_index: Option<u32>,
+    },
     /// Show wallet info
     Info,
+    /// Sweep available seller earnings from a range of HD child wallets
+    /// (m/44'/60'/0'/0/{i} for i in start_index..start_index+count) into a
+    /// single central Tempo address. Each child is authenticated in memory;
+    /// the on-disk wallet and session token are left untouched.
+    Sweep {
+        /// Master mnemonic phrase
+        phrase: String,
+        /// First child index to sweep
+        #[arg(long, default_value = "0")]
+        start_index: u32,
+        /// Number of children to sweep
+        #[arg(long)]
+        count: u32,
+        /// Central Tempo wallet address receiving the payouts
+        #[arg(long)]
+        target_tempo: String,
+        /// Only create a payout when a child's available earnings are at
+        /// least this many microcredits (1,000,000 = $1.00)
+        #[arg(long, default_value = "1000000")]
+        min_threshold: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -366,10 +394,7 @@ impl BackendClient {
     }
 
     fn token_path() -> std::path::PathBuf {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".proxybase")
-            .join("session_token")
+        data_dir().join("session_token")
     }
 
     fn load_token() -> Option<String> {
@@ -1229,10 +1254,19 @@ async fn try_seller_connection(
     Ok(())
 }
 
+/// Shared client state directory. PROXYBASE_DIR (containers, isolated scratch
+/// runs) wins over the default ~/.proxybase.
+fn data_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("PROXYBASE_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
+    }
+    dirs::home_dir().unwrap_or_default().join(".proxybase")
+}
+
 pub(crate) fn wallet_dir() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".proxybase")
+    data_dir()
 }
 
 fn load_wallet() -> Result<libproxybase::WalletManager> {
@@ -1302,7 +1336,7 @@ async fn main() -> Result<()> {
     if !matches!(cli.command, Commands::Update { .. }) {
         update::check_and_notify().await;
     }
-    let client = BackendClient::new(&cli.backend);
+    let mut client = BackendClient::new(&cli.backend);
 
     match cli.command {
         // --- Wallet ---
@@ -1315,11 +1349,109 @@ async fn main() -> Result<()> {
                 println!("Mnemonic (SAVE THIS SECURELY):");
                 println!("  {}", mnemonic);
             }
-            WalletCmd::Import { phrase } => {
+            WalletCmd::Import { phrase, hd_index } => {
                 let mut wm = libproxybase::WalletManager::new(wallet_dir())?;
-                wm.import(&phrase, "")?;
-                println!("Wallet imported successfully!");
+                // Keystore password comes from PROXYBASE_PASSWORD (containers),
+                // defaulting to "" for interactive/legacy use. load_wallet()
+                // tries the same order, so both sides stay consistent.
+                let password = std::env::var("PROXYBASE_PASSWORD").unwrap_or_default();
+                match hd_index {
+                    Some(index) => {
+                        wm.import_hd(&phrase, index, &password)?;
+                        println!("Wallet imported successfully (HD index {}: m/44'/60'/0'/0/{})", index, index);
+                    }
+                    None => {
+                        wm.import(&phrase, &password)?;
+                        println!("Wallet imported successfully!");
+                    }
+                }
                 println!("Address: {}", wm.address().unwrap_or("unknown"));
+            }
+            WalletCmd::Sweep { phrase, start_index, count, target_tempo, min_threshold } => {
+                if count == 0 {
+                    anyhow::bail!("--count must be at least 1");
+                }
+                let seed = libproxybase::wallet::mnemonic::mnemonic_to_seed(&phrase, "")?;
+                // Preserve the operator's on-disk session token: child logins
+                // only mutate the in-memory client.
+                let saved_token = client.token.clone();
+                let mut payouts = 0u32;
+                let mut swept_total = 0i64;
+
+                println!(
+                    "Sweeping HD children {}..{} -> {} (min threshold {} microcredits)",
+                    start_index,
+                    start_index + count - 1,
+                    target_tempo,
+                    min_threshold,
+                );
+                for index in start_index..start_index + count {
+                    let (sk, vk) = match libproxybase::wallet::hd::derive_bip44_keypair(&seed, index) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("[{index}] derivation failed: {e}");
+                            continue;
+                        }
+                    };
+                    let address = libproxybase::wallet::keypair::public_key_to_address(&vk)?;
+
+                    let challenge = match client.auth_challenge(&address).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[{index}] {address}: challenge failed: {e}");
+                            continue;
+                        }
+                    };
+                    use k256::ecdsa::signature::Signer;
+                    let message = format!("{}:{}:{}", address, challenge.nonce, challenge.timestamp);
+                    let signature: k256::ecdsa::Signature = sk.sign(message.as_bytes());
+                    let sig_hex = hex::encode(signature.to_vec());
+                    let public_key_hex = hex::encode(vk.to_sec1_bytes());
+                    let auth = match client
+                        .auth_verify(&public_key_hex, &challenge.nonce, &challenge.timestamp, &sig_hex)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[{index}] {address}: auth verify failed: {e}");
+                            continue;
+                        }
+                    };
+                    client.token = Some(auth.session_token);
+
+                    // Query the ledger directly. GET /v2/seller/status only
+                    // reports earnings for nodes currently connected to the
+                    // in-memory seller pool, so an offline child would read
+                    // as zero. GET /v2/wallet/balance returns seller_available
+                    // from the ledger regardless of connection state.
+                    let balance = match client.get_balance().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[{index}] {address}: balance lookup failed: {e}");
+                            continue;
+                        }
+                    };
+                    let available = balance
+                        .get("seller_available")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
+                    if available < min_threshold {
+                        println!("[{index}] {address}: {available} microcredits (below threshold {min_threshold})");
+                        continue;
+                    }
+                    match client.create_payout(available, &target_tempo).await {
+                        Ok(resp) => {
+                            let payout_id = resp.pointer("/payout_id").and_then(|v| v.as_str()).unwrap_or("?");
+                            println!("[{index}] {address}: payout {available} microcredits -> {target_tempo} (payout {payout_id})");
+                            swept_total += available;
+                            payouts += 1;
+                        }
+                        Err(e) => eprintln!("[{index}] {address}: payout failed: {e}"),
+                    }
+                }
+                client.token = saved_token;
+                println!("Sweep complete: {payouts} payout(s), {swept_total} microcredits total.");
             }
             WalletCmd::Info => {
                 match load_wallet() {
@@ -1797,6 +1929,88 @@ mod tests {
     fn test_wallet_dir() {
         let dir = wallet_dir();
         assert!(dir.ends_with(".proxybase"));
+    }
+
+    #[test]
+    fn test_wallet_import_hd_index_flag() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "wallet",
+            "import",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Wallet { cmd: WalletCmd::Import { hd_index, .. } } => {
+                // No flag → legacy raw-seed import (backward compatible)
+                assert!(hd_index.is_none());
+            }
+            _ => panic!("expected wallet import"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "wallet",
+            "import",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "--hd-index",
+            "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Wallet { cmd: WalletCmd::Import { hd_index, .. } } => {
+                assert_eq!(hd_index, Some(7));
+            }
+            _ => panic!("expected wallet import"),
+        }
+    }
+
+    #[test]
+    fn test_wallet_sweep_parsing() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "wallet",
+            "sweep",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "--count",
+            "10",
+            "--target-tempo",
+            "0x1234567890abcdef",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Wallet { cmd: WalletCmd::Sweep { start_index, count, target_tempo, min_threshold, .. } } => {
+                assert_eq!(start_index, 0);
+                assert_eq!(count, 10);
+                assert_eq!(target_tempo, "0x1234567890abcdef");
+                assert_eq!(min_threshold, 1_000_000);
+            }
+            _ => panic!("expected wallet sweep"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "wallet",
+            "sweep",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "--start-index",
+            "5",
+            "--count",
+            "3",
+            "--target-tempo",
+            "0xabc",
+            "--min-threshold",
+            "500",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Wallet { cmd: WalletCmd::Sweep { start_index, count, min_threshold, .. } } => {
+                assert_eq!(start_index, 5);
+                assert_eq!(count, 3);
+                assert_eq!(min_threshold, 500);
+            }
+            _ => panic!("expected wallet sweep"),
+        }
     }
 
     // ── Relay loop tests (CLOSE_WAIT regression) ──

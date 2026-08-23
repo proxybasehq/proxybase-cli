@@ -1,0 +1,59 @@
+# ProxyBase HD seller fleet on Docker Compose (residential / VPS stacks).
+#
+# Each service pins PROXYBASE_HD_INDEX so the entrypoint derives a distinct
+# wallet address from the shared MASTER_MNEMONIC:
+#   seller-0 -> m/44'/60'/0'/0/0
+#   seller-1 -> m/44'/60'/0'/0/1
+#   ...
+#
+# Usage:
+#   1. Replace MASTER_MNEMONIC below with your real master phrase
+#      (prefer an .env file: MASTER_MNEMONIC="..." PROXYBASE_PASSWORD="...").
+#   2. docker compose -f docker-compose.hd.yaml up -d
+#   3. docker compose -f docker-compose.hd.yaml up -d --scale seller-2=3
+#      (further nodes get hash-derived indices; pin PROXYBASE_HD_INDEX for
+#      deterministic identities).
+#
+# .proxybase is a tmpfs: keys and tokens live in RAM only; a replacement
+# container with the same index re-derives the identical identity.
+
+x-seller-base: &seller-base
+  image: ghcr.io/proxybasehq/proxybase-cli:latest
+  restart: unless-stopped
+  tmpfs:
+    - /home/proxybase/.proxybase:size=16M
+  deploy:
+    resources:
+      limits:
+        cpus: '0.20'
+        memory: 128M
+  environment:
+    - PROXYBASE_BACKEND=https://api.proxybase.xyz
+    - MASTER_MNEMONIC=abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+    - PROXYBASE_PASSWORD=dev_secret
+
+services:
+  seller-0:
+    <<: *seller-base
+    container_name: proxybase-seller-0
+    environment:
+      - PROXYBASE_BACKEND=https://api.proxybase.xyz
+      - MASTER_MNEMONIC=abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+      - PROXYBASE_PASSWORD=dev_secret
+      - PROXYBASE_HD_INDEX=0
+  seller-1:
+    <<: *seller-base
+    container_name: proxybase-seller-1
+    environment:
+      - PROXYBASE_BACKEND=https://api.proxybase.xyz
+      - MASTER_MNEMONIC=abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+      - PROXYBASE_PASSWORD=dev_secret
+      - PROXYBASE_HD_INDEX=1
+  seller-2:
+    <<: *seller-base
+    container_name: proxybase-seller-2
+    environment:
+      - PROXYBASE_BACKEND=https://api.proxybase.xyz
+      - MASTER_MNEMONIC=abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+      - PROXYBASE_PASSWORD=dev_secret
+      - PROXYBASE_HD_INDEX=2
