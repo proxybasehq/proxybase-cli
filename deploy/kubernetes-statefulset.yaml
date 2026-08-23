@@ -34,11 +34,12 @@ metadata:
 spec:
   serviceName: "proxybase-seller-mesh"
   replicas: 10 # Instant scale from 1 to 100+ nodes
-  podManagementPolicy: Parallel
+  # OrderedReady (the default) is required for collision-free rolling updates:
+  # pods terminate in reverse ordinal order (9 -> 8 -> 7...) and a replacement
+  # only starts once its ordinal has fully terminated, so wallet A_i can never
+  # have two live connections. Switch to Parallel only if you accept a brief
+  # same-wallet overlap during upgrades in exchange for faster scale-up.
   updateStrategy:
-    # RollingUpdate updates in reverse ordinal order (9 -> 8 -> 7...).
-    # Because ordinal i must shut down before its replacement starts,
-    # dual-connection collisions on wallet A_i are impossible during upgrades.
     type: RollingUpdate
   selector:
     matchLabels:

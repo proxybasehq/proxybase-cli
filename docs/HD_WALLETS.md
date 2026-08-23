@@ -156,8 +156,10 @@ Ready-to-use manifests live in `deploy/`:
 
 - **`deploy/kubernetes-statefulset.yaml`** — StatefulSet whose pod ordinals
   (stable hostnames `proxybase-seller-0`, `-1`, ...) become HD indices
-  automatically. `emptyDir: Memory` keeps keys in RAM; reverse-ordinal
-  rolling updates eliminate dual-connection collisions during upgrades.
+  automatically. `emptyDir: Memory` keeps keys in RAM. `OrderedReady`
+  pod management (the default) makes rolling updates collision-free: pods
+  terminate in reverse ordinal order and a replacement starts only after its
+  ordinal has fully terminated, so wallet A_i never has two live connections.
   Scale: `kubectl scale statefulset proxybase-seller --replicas=100`.
 - **`deploy/docker-compose.hd.yaml`** — multi-node Compose stack with
   per-service `PROXYBASE_HD_INDEX` and tmpfs state.
@@ -172,9 +174,11 @@ Ready-to-use manifests live in `deploy/`:
   SealedSecrets, HashiCorp Vault, or AWS Secrets Manager; restrict read
   access to the seller service account. Prefer `/etc/secrets/master-mnemonic`
   over env vars (env leaks into debug endpoints and subprocess listings).
-- **Update thrashing** — StatefulSet rolling updates proceed highest ordinal
-  first (N → N-1 → ... → 0), so ordinal `i` shuts down before its replacement
-  starts; wallet `A_i` can never have two live connections.
+- **Update thrashing** — with the default `OrderedReady` pod management,
+  StatefulSet rolling updates terminate pods highest ordinal first
+  (N → N-1 → ... → 0) and start a replacement only after its ordinal has
+  fully terminated; wallet `A_i` can never have two live connections.
+  `podManagementPolicy: Parallel` trades this guarantee for faster scale-up.
 - **Grace period** — keep `terminationGracePeriodSeconds: 20`. `tini` (PID 1)
   forwards SIGTERM to the CLI, which closes the WebSocket cleanly before the
   replacement pod handshakes.
