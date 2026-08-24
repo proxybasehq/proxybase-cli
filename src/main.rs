@@ -364,6 +364,12 @@ enum MarketCmd {
     Close {
         session_id: String,
     },
+    /// Rotate exit node for an active sticky session
+    Rotate {
+        /// Session ID to rotate
+        #[arg(long)]
+        id: String,
+    },
     /// List active/past sessions
     Sessions,
     /// Get a single session's details
@@ -622,6 +628,26 @@ impl BackendClient {
             .send()
             .await?;
         Ok(resp.json().await?)
+    }
+
+    async fn rotate_session(&self, session_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(format!("{}/v2/sessions/{}/rotate", self.base_url, session_id))
+            .header("Authorization", self.bearer())
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("reason")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to rotate session");
+            anyhow::bail!("{}: {}", status, msg);
+        }
+        Ok(body)
     }
 
     async fn get_session(&self, session_id: &str) -> Result<serde_json::Value> {
@@ -1766,6 +1792,10 @@ async fn main() -> Result<()> {
                 }
                 MarketCmd::Close { session_id } => {
                     let result = client.close_session(&session_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                MarketCmd::Rotate { id } => {
+                    let result = client.rotate_session(&id).await?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
                 MarketCmd::Sessions => {
