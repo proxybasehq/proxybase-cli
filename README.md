@@ -22,9 +22,21 @@ env vars, fleet sweeper cron) is documented in
 
 ## Build
 
+`proxybase-cli` depends on the sibling crate
+[`libproxybase`](https://github.com/proxybasehq/libproxybase) through a path
+dependency (`../libproxybase`), so check both repositories out side by side
+before building:
+
 ```bash
+git clone https://github.com/proxybasehq/libproxybase
+git clone https://github.com/proxybasehq/proxybase-cli
+cd proxybase-cli
 cargo build --release
 ```
+
+Without `libproxybase` present as a sibling directory the build fails during
+dependency resolution with `failed to load source for dependency
+\`libproxybase\``.
 
 ## GitHub Actions
 
