@@ -398,15 +398,72 @@ impl BackendClient {
     }
 
     fn load_token() -> Option<String> {
-        std::fs::read_to_string(Self::token_path()).ok()
+        let path = Self::token_path();
+        Self::harden_token_file(&path);
+        std::fs::read_to_string(path).ok()
     }
 
     fn save_token(token: &str) {
-        let path = Self::token_path();
+        Self::save_token_in(&data_dir(), token);
+    }
+
+    /// The session token is password-equivalent: it can spend the account
+    /// balance, so it must never land world-readable on disk.
+    fn save_token_in(dir: &std::path::Path, token: &str) {
+        let path = dir.join("session_token");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
-        let _ = std::fs::write(&path, token);
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                if file.write_all(token.as_bytes()).is_ok() {
+                    // OpenOptions .mode only applies at creation; an existing
+                    // file keeps its old mode, so enforce it here as well.
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(&path, token);
+        }
+    }
+
+    /// Tighten permissions left behind by older versions.
+    fn harden_token_file(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    let _ =
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
     }
 
     fn bearer(&self) -> String {
@@ -2177,5 +2234,37 @@ mod tests {
             .expect("relay must not panic");
 
         assert!(relay_rx.recv().await.is_none());
+    }
+    #[test]
+    fn session_token_file_is_private() {
+        let dir = std::env::temp_dir().join(format!(
+            "proxybase-token-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        BackendClient::save_token_in(&dir, "secret-token");
+        let path = dir.join("session_token");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret-token");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| {
+                std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&dir), 0o700);
+
+            // Self-heal: a leftover world-readable token gets tightened on load.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            BackendClient::harden_token_file(&path);
+            assert_eq!(mode(&path), 0o600);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
