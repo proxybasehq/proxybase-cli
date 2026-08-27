@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod update;
+mod bridge;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
@@ -56,6 +57,11 @@ enum Commands {
     Market {
         #[command(subcommand)]
         cmd: MarketCmd,
+    },
+    /// Local SOCKS5 bridge for buyer sessions
+    Bridge {
+        #[command(subcommand)]
+        cmd: BridgeCmd,
     },
     /// Backend health check
     Health,
@@ -226,6 +232,33 @@ fn parse_upstream_metadata(username: &str) -> (Option<String>, Option<String>) {
     (country, category)
 }
 
+/// Resolve the remote SOCKS5 gateway address from the backend URL.
+/// The v2 buyer gateway always listens on port 1082 on the same host as the
+/// backend API (127.0.0.1 in dev, api.proxybase.xyz in production).
+fn socks5_proxy_address(backend_url: &str) -> String {
+    let candidate = if backend_url.contains("://") {
+        backend_url.to_string()
+    } else {
+        format!("http://{}", backend_url)
+    };
+    let host = url::Url::parse(&candidate)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    format!("{}:1082", host)
+}
+
+/// Print remote SOCKS5 connection instructions for a session.
+fn print_session_credentials(sid: &str, token: &str, proxy_addr: &str, backend_url: &str) {
+    let base = backend_url.trim_end_matches('/');
+    println!("SOCKS5 proxy: {}", proxy_addr);
+    println!("  Username: {}", sid);
+    println!("  Password: {}", token);
+    println!("");
+    println!("Example:");
+    println!("  curl --socks5 {} --proxy-user {}:{} {}/v2/ip", proxy_addr, sid, token, base);
+}
+
 // ---------------------------------------------------------------------------
 // Seller config persistence (for daemon / reboot survival)
 // ---------------------------------------------------------------------------
@@ -267,6 +300,137 @@ fn load_seller_config() -> Result<SellerConfig> {
     let content = std::fs::read_to_string(&path)
         .context("No saved seller config. Run 'seller start --upstream ...' first to save configuration.")?;
     Ok(serde_json::from_str(&content)?)
+}
+
+// ---------------------------------------------------------------------------
+// Bridge state persistence (one bridge process per buyer session)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct BridgeState {
+    session_id: String,
+    port: u16,
+    pid: u32,
+    backend_url: String,
+    upstream_addr: String,
+}
+
+fn bridge_state_dir() -> std::path::PathBuf {
+    wallet_dir().join("bridges")
+}
+
+fn bridge_state_path(session_id: &str) -> std::path::PathBuf {
+    bridge_state_dir().join(format!("{}.json", session_id))
+}
+
+fn save_bridge_state(state: &BridgeState) -> Result<()> {
+    let path = bridge_state_path(&state.session_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+fn load_bridge_state(session_id: &str) -> Result<BridgeState> {
+    let content = std::fs::read_to_string(bridge_state_path(session_id))?;
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// daemon-kit daemon handle for one session's bridge process. The pid file
+/// lives in the wallet dir next to the seller's (proxybase-bridge-<sid>.pid).
+fn bridge_daemon(session_id: &str) -> daemon_kit::Daemon {
+    let config = daemon_kit::DaemonConfig::new(&format!("proxybase-bridge-{}", session_id))
+        .pid_dir(wallet_dir())
+        .log_file(wallet_dir().join(format!("bridge-{}.log", session_id)))
+        .service_args(vec![
+            "bridge".to_string(),
+            "start".to_string(),
+            session_id.to_string(),
+            "--foreground".to_string(),
+        ])
+        .description("ProxyBase Local SOCKS5 Bridge");
+    daemon_kit::Daemon::new(config)
+}
+
+/// Spawn the bridge as a detached background process (same pattern as
+/// 'seller start'). The child binds the port and writes its state file;
+/// we poll for it so the caller learns the actual bound port.
+async fn start_bridge_background(
+    backend_url: &str,
+    session_id: &str,
+    upstream: &str,
+    port: Option<u16>,
+) -> Result<u16> {
+    let daemon = bridge_daemon(session_id);
+    if daemon.is_running() {
+        if let Ok(state) = load_bridge_state(session_id) {
+            println!(
+                "Bridge for session {} is already running on port {}.",
+                session_id, state.port
+            );
+            return Ok(state.port);
+        }
+        anyhow::bail!(
+            "Bridge daemon already running (PID: {}). Use 'bridge stop {}' first, or 'bridge list'.",
+            daemon.running_pid().unwrap_or(0),
+            session_id
+        );
+    }
+
+    // Clear stale state from a previous run so the poll below only succeeds
+    // once THIS child has reported its port.
+    let _ = std::fs::remove_file(bridge_state_path(session_id));
+
+    let exe = std::env::current_exe()
+        .context("Cannot determine current executable path")?;
+    let log_path = wallet_dir().join(format!("bridge-{}.log", session_id));
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .context("Cannot open bridge log file")?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("bridge")
+        .arg("start")
+        .arg(session_id)
+        .arg("--foreground")
+        .arg("--backend")
+        .arg(backend_url)
+        .arg("--upstream")
+        .arg(upstream);
+    if let Some(p) = port {
+        cmd.arg("--port").arg(p.to_string());
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file);
+    let child = cmd
+        .spawn()
+        .context("Failed to spawn bridge daemon process")?;
+
+    // The child may take a moment to bind (and may fall back to an ephemeral
+    // port). Poll its state file, then give up and point at the log.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match load_bridge_state(session_id) {
+            Ok(state) if state.pid == child.id() => return Ok(state.port),
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "Bridge process started (PID {}) but did not report its port within 5s. Check {}",
+        child.id(),
+        log_path.display()
+    );
 }
 
 fn seller_daemon() -> daemon_kit::Daemon {
@@ -359,6 +523,12 @@ enum MarketCmd {
         session_type: String,
         #[arg(long)]
         sticky_duration: Option<u64>,
+        /// Also start a local unauthenticated SOCKS5 bridge for the session
+        #[arg(long)]
+        bridge: bool,
+        /// Preferred local port for the --bridge listener
+        #[arg(long)]
+        bridge_port: Option<u16>,
     },
     /// Close a session
     Close {
@@ -378,6 +548,43 @@ enum MarketCmd {
         #[arg(long)]
         id: String,
     },
+    /// Send a keepalive ping to an active session (prevents the 1h idle timeout)
+    Keepalive {
+        /// Session ID
+        #[arg(long)]
+        id: String,
+        /// Repeat every 5 minutes until interrupted
+        #[arg(long = "loop")]
+        loop_: bool,
+    },
+}
+
+/// Local unauthenticated SOCKS5 bridge for a buyer session. Forwards to the
+/// authenticated remote gateway (username = session id, password = session
+/// token) so apps without SOCKS5 auth support can use the session.
+#[derive(Subcommand)]
+enum BridgeCmd {
+    /// Start a bridge. Daemonizes by default; use --foreground to keep it in
+    /// the terminal (used internally by 'bridge start' in background mode).
+    Start {
+        /// Session ID (from 'market buy')
+        session_id: String,
+        /// Preferred local port (falls back to an ephemeral port if taken)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override the upstream SOCKS5 gateway address (default: derived from --backend)
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Run in foreground (don't daemonize)
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop a running bridge
+    Stop {
+        session_id: String,
+    },
+    /// List running bridges
+    List,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,10 +628,6 @@ impl BackendClient {
 
     fn is_authenticated(&self) -> bool {
         self.token.is_some()
-    }
-
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
     }
 
     // --- Auth ---
@@ -654,6 +857,25 @@ impl BackendClient {
         let resp = self.http.get(format!("{}/v2/sessions/{}", self.base_url, session_id))
             .header("Authorization", self.bearer()).send().await?;
         Ok(resp.json().await?)
+    }
+
+    async fn keepalive_session(&self, session_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(format!("{}/v2/sessions/{}/keepalive", self.base_url, session_id))
+            .header("Authorization", self.bearer())
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to send keepalive");
+            anyhow::bail!("{}: {}", status, msg);
+        }
+        Ok(body)
     }
 
     async fn health(&self) -> Result<serde_json::Value> {
@@ -1099,187 +1321,6 @@ async fn try_single_path_connection(
     Ok(())
 }
 
-async fn run_seller_ws_loop(
-    mut client: BackendClient,
-    upstreams: Vec<UpstreamProxy>,
-    include_direct: bool,
-) -> Result<()> {
-    let pool: Vec<Option<UpstreamProxy>> = {
-        let mut v: Vec<Option<UpstreamProxy>> = Vec::new();
-        if include_direct || upstreams.is_empty() { v.push(None); }
-        for u in upstreams { v.push(Some(u)); }
-        v
-    };
-    let pool = std::sync::Arc::new(pool);
-
-    let mut backoff_secs = 1u64;
-    loop {
-        let token = client.token.as_deref().unwrap_or("").to_string();
-        let ws_url = format!(
-            "{}/v2/ws/seller?token={}",
-            client.base_url.replace("http://", "ws://").replace("https://", "wss://"),
-            token
-        );
-
-        println!("Connecting to {} (backoff={}s)...", ws_url, backoff_secs);
-        match try_seller_connection(&ws_url, &token, pool.clone()).await {
-            Ok(()) => {
-                backoff_secs = 1;
-                eprintln!("Disconnected. Reconnecting...");
-            }
-            Err(e) if e.to_string().contains("AUTH_EXPIRED") || e.to_string().contains("401") => {
-                eprintln!("Session token expired or invalid. Re-authenticating...");
-                match re_authenticate(&mut client).await {
-                    Ok(()) => {
-                        eprintln!("Re-authenticated successfully.");
-                        backoff_secs = 1;
-                    }
-                    Err(auth_err) => {
-                        eprintln!("Re-authentication failed: {}. Retrying in {}s...", auth_err, backoff_secs);
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Connection failed: {}. Retrying in {}s...", e, backoff_secs);
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(60);
-            }
-        }
-    }
-}
-
-async fn re_authenticate(client: &mut BackendClient) -> Result<()> {
-    let wm = load_wallet()
-        .context("No wallet found. Cannot re-authenticate.")?;
-    let address = wm.address()
-        .ok_or_else(|| anyhow::anyhow!("Wallet not loaded"))?;
-
-    let challenge = client.auth_challenge(address).await?;
-    let message = format!("{}:{}:{}", address, challenge.nonce, challenge.timestamp);
-    let signature = wm.sign(message.as_bytes())?;
-    let sig_hex = hex::encode(&signature);
-    let public_key_hex = wm.public_key_hex()
-        .ok_or_else(|| anyhow::anyhow!("Cannot get public key"))?;
-
-    let auth = client.auth_verify(&public_key_hex, &challenge.nonce, &challenge.timestamp, &sig_hex).await?;
-    BackendClient::save_token(&auth.session_token);
-    client.token = Some(auth.session_token);
-    Ok(())
-}
-
-async fn try_seller_connection(
-    ws_url: &str,
-    token: &str,
-    pool: std::sync::Arc<Vec<Option<UpstreamProxy>>>,
-) -> Result<()> {
-    let (ws, _resp) = tokio::time::timeout(
-        tokio::time::Duration::from_secs(15),
-        connect_async(ws_url),
-    )
-    .await
-    .context("connect_async timed out after 15s")?
-    .context("Failed to connect WebSocket")?;
-    let conn_id = uuid::Uuid::new_v4().to_string();
-    println!("Connected (conn={}). Press Ctrl+C to stop.", &conn_id[..8]);
-
-    let (mut ws_sink, mut ws_stream) = ws.split();
-
-    // Send auth token as the first message (required by standalone WS listener on port 1081).
-    ws_sink
-        .send(Message::Text(token.to_string()))
-        .await
-        .context("Failed to send auth token")?;
-
-    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let active: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> = Default::default();
-
-    let relay_drain = tokio::spawn(async move {
-        while let Some(msg) = relay_rx.recv().await {
-            if ws_sink.send(msg).await.is_err() { break; }
-        }
-    });
-
-    let mut ping_tick = interval(Duration::from_secs(30));
-    let mut heartbeat_tick = interval(Duration::from_secs(15));
-
-    loop {
-        tokio::select! {
-            _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
-            _ = heartbeat_tick.tick() => {
-                let current_streams = active.lock().await.len() as u32;
-                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":env!("CARGO_PKG_VERSION"),"conn_id":conn_id});
-                let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
-            }
-            msg = ws_stream.next() => {
-                match msg {
-                    Some(Ok(Message::Ping(d))) => { let _ = relay_tx.send(Message::Pong(d)); }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&text) {
-                            // Detect auth-token rejection from the server
-                            if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
-                                return Err(anyhow::anyhow!("AUTH_EXPIRED"));
-                            }
-                            match p.get("type").and_then(|v| v.as_str()) {
-                                Some("relay_data") => {
-                                    if let Some(enc) = p.get("data").and_then(|v| v.as_str()) {
-                                        if let Some(dec) = base64_decode(enc) {
-                                            let streams = active.lock().await;
-                                            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-                                            // Unknown sid: the stream ended on our side before the
-                                            // backend learned about it. Drop — sending to an
-                                            // arbitrary other stream would corrupt its traffic.
-                                            if let Some(s) = streams.get(sid) { let _ = s.send(dec); }
-                                        }
-                                    }
-                                }
-                                Some("stream_open") => {
-                                    let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                                    let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
-                                    let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
-                                    let thost = p.get("target_host").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                    let dest = thost.unwrap_or_else(|| tip.clone());
-                                    // Backend controls routing: use route_index if provided, else hash session_id
-                                    let route_idx = p.get("route_index")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|i| i as usize);
-                                    eprintln!("[STREAM] {} → {}:{} (direct_ip={})", sid, dest, tport, tip);
-
-                                    let streams = active.clone();
-                                    let tx = relay_tx.clone();
-                                    let idx = route_idx.unwrap_or_else(|| {
-                                        let mut h: usize = 0;
-                                        for b in sid.as_bytes() { h = h.wrapping_mul(31).wrapping_add(*b as usize); }
-                                        h % pool.len()
-                                    });
-                                    let up = pool[idx].clone();
-
-                                    let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                                    streams.lock().await.insert(sid.clone(), tcp_tx);
-
-                                    tokio::spawn(async move {
-                                        let up_ref: Option<&UpstreamProxy> = up.as_ref();
-                                        run_stream_relay(&dest, &tip, tport, up_ref, &tx, tcp_rx, &sid).await;
-                                        streams.lock().await.remove(&sid);
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => { eprintln!("Backend closed connection"); break; }
-                    Some(Err(e)) => { eprintln!("WS error: {}", e); break; }
-                    _ => {}
-                }
-            }
-        }
-    }
-    relay_drain.abort();
-    Ok(())
-}
-
 /// Shared client state directory. PROXYBASE_DIR (containers, isolated scratch
 /// runs) wins over the default ~/.proxybase.
 fn data_dir() -> std::path::PathBuf {
@@ -1345,6 +1386,9 @@ async fn authenticate(client: &BackendClient, wm: &libproxybase::WalletManager) 
 
     BackendClient::save_token(&auth.session_token);
     println!("Authenticated as: {}", auth.wallet_address);
+    println!("  Role: {}", auth.role);
+    println!("  Buyer available: {} microcredits", auth.buyer_available);
+    println!("  Spendable balance: {} microcredits", auth.spendable_balance);
     println!("Session token saved.");
 
     Ok(auth.session_token)
@@ -1773,6 +1817,8 @@ async fn main() -> Result<()> {
                     network_type,
                     session_type,
                     sticky_duration: _,
+                    bridge,
+                    bridge_port,
                 } => {
                     let session = client
                         .create_session(&country, &network_type, &session_type, None)
@@ -1780,14 +1826,17 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&session)?);
                     if let Some(sid) = session.get("session_id").and_then(|v| v.as_str()) {
                         let token = client.token.as_deref().unwrap_or("");
+                        let proxy_addr = socks5_proxy_address(&cli.backend);
                         println!("Session {} opened.", sid);
                         println!("");
-                        println!("SOCKS5 proxy: 127.0.0.1:1082");
-                        println!("  Username: {}", sid);
-                        println!("  Password: {}", token);
-                        println!("");
-                        println!("Example:");
-                        println!("  curl --socks5 127.0.0.1:1082 --proxy-user {}:{} http://api.proxybase.xyz/v2/ip", sid, token);
+                        print_session_credentials(sid, token, &proxy_addr, &cli.backend);
+                        if bridge {
+                            let port = start_bridge_background(&cli.backend, sid, &proxy_addr, bridge_port).await?;
+                            println!("");
+                            println!("Local bridge (no auth): 127.0.0.1:{}", port);
+                            println!("Example:");
+                            println!("  curl --socks5 127.0.0.1:{} {}/v2/ip", port, cli.backend.trim_end_matches('/'));
+                        }
                     }
                 }
                 MarketCmd::Close { session_id } => {
@@ -1801,11 +1850,166 @@ async fn main() -> Result<()> {
                 MarketCmd::Sessions => {
                     let sessions = client.list_sessions().await?;
                     println!("{}", serde_json::to_string_pretty(&sessions)?);
+                    let entries = sessions
+                        .get("sessions")
+                        .and_then(|s| s.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if !entries.is_empty() {
+                        let proxy_addr = socks5_proxy_address(&cli.backend);
+                        let token = client.token.as_deref().unwrap_or("");
+                        println!("\nActive sessions:");
+                        for s in &entries {
+                            let sid = s.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let country = s.get("country").and_then(|v| v.as_str()).unwrap_or("?");
+                            let network = s.get("network_type").and_then(|v| v.as_str()).unwrap_or("?");
+                            let stype = s.get("session_type").and_then(|v| v.as_str()).unwrap_or("?");
+                            println!("  {}  {} {} {}  →  {} (user {} / pass {})", sid, country, network, stype, proxy_addr, sid, token);
+                        }
+                        if let Some(sid) = entries.first().and_then(|s| s.get("session_id")).and_then(|v| v.as_str()) {
+                            println!("\nExample:");
+                            println!("  curl --socks5 {} --proxy-user {}:{} {}/v2/ip", proxy_addr, sid, token, cli.backend.trim_end_matches('/'));
+                        }
+                    }
                 }
                 MarketCmd::SessionStatus { id } => {
                     let session = client.get_session(&id).await?;
                     println!("{}", serde_json::to_string_pretty(&session)?);
+                    if session.get("status").and_then(|v| v.as_str()) == Some("active") {
+                        let sid = session.get("session_id").and_then(|v| v.as_str()).unwrap_or(id.as_str());
+                        let token = client.token.as_deref().unwrap_or("");
+                        let proxy_addr = socks5_proxy_address(&cli.backend);
+                        println!("");
+                        print_session_credentials(sid, token, &proxy_addr, &cli.backend);
+                    }
                 }
+                MarketCmd::Keepalive { id, loop_ } => {
+                    if loop_ {
+                        let interval_secs = 300u64;
+                        println!("Sending keepalive for session {} every {}s. Press Ctrl+C to stop.", id, interval_secs);
+                        let mut tick = interval(Duration::from_secs(interval_secs));
+                        loop {
+                            tick.tick().await;
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            match client.keepalive_session(&id).await {
+                                Ok(resp) => {
+                                    let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("alive");
+                                    println!("[{}] Session {} keepalive: {}", now, id, status);
+                                }
+                                Err(e) => eprintln!("[{}] Session {} keepalive failed: {}", now, id, e),
+                            }
+                        }
+                    } else {
+                        let resp = client.keepalive_session(&id).await?;
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                        println!("Session {} keepalive sent successfully.", id);
+                    }
+                }
+            }
+        }
+
+        // --- Bridge ---
+        Commands::Bridge { cmd } => match cmd {
+            // Stop/List are daemon-only (no auth required)
+            BridgeCmd::Stop { session_id } => {
+                let daemon = bridge_daemon(&session_id);
+                match daemon.stop() {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(bridge_state_path(&session_id));
+                        println!("Bridge {} stopped.", session_id);
+                    }
+                    Err(daemon_kit::DaemonError::NotRunning) => {
+                        let _ = std::fs::remove_file(bridge_state_path(&session_id));
+                        println!("Bridge {} is not running.", session_id);
+                    }
+                    Err(e) => anyhow::bail!("Failed to stop bridge: {e}"),
+                }
+            }
+            BridgeCmd::List => {
+                let dir = bridge_state_dir();
+                let mut found = false;
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                            continue;
+                        }
+                        let state: BridgeState = match std::fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|c| serde_json::from_str(&c).ok())
+                        {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let daemon = bridge_daemon(&state.session_id);
+                        if daemon.is_running() {
+                            found = true;
+                            println!(
+                                "Session {}: 127.0.0.1:{} (PID {})",
+                                state.session_id,
+                                state.port,
+                                daemon.running_pid().unwrap_or(0)
+                            );
+                        } else {
+                            // Stale state from a killed process — clean it up.
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+                if !found {
+                    println!("No bridges running.");
+                }
+            }
+            BridgeCmd::Start { session_id, port, upstream, foreground } => {
+                if !client.is_authenticated() {
+                    anyhow::bail!("Not authenticated. Run 'proxybase-cli login' first.");
+                }
+                let upstream_addr = upstream.unwrap_or_else(|| socks5_proxy_address(&cli.backend));
+
+                if foreground {
+                    // Bound listener, report port via state file, then run
+                    // until the process is killed (SIGTERM/SIGINT). The OS
+                    // releases the listener socket on exit; 'bridge stop' and
+                    // 'bridge list' clean up stale state.
+                    let local_port = bridge::start_bridge(
+                        &session_id,
+                        &cli.backend,
+                        &upstream_addr,
+                        port,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                    // PID file first so 'bridge stop' can find us the moment
+                    // the parent's state-file poll succeeds.
+                    let _ = std::fs::write(
+                        wallet_dir().join(format!("proxybase-bridge-{}.pid", session_id)),
+                        std::process::id().to_string(),
+                    );
+                    let state = BridgeState {
+                        session_id: session_id.clone(),
+                        port: local_port,
+                        pid: std::process::id(),
+                        backend_url: cli.backend.clone(),
+                        upstream_addr: upstream_addr.clone(),
+                    };
+                    save_bridge_state(&state)?;
+                    println!(
+                        "Bridge for session {} listening on 127.0.0.1:{} (no auth) — PID {}",
+                        session_id,
+                        local_port,
+                        std::process::id()
+                    );
+                    std::future::pending::<()>().await;
+                }
+
+                let local_port = start_bridge_background(&cli.backend, &session_id, &upstream_addr, port).await?;
+                println!("Bridge started for session {}.", session_id);
+                println!("  Local SOCKS5: 127.0.0.1:{} (no auth)", local_port);
+                println!("Example:");
+                println!("  curl --socks5 127.0.0.1:{} {}/v2/ip", local_port, cli.backend.trim_end_matches('/'));
             }
         }
 
@@ -1934,6 +2138,202 @@ mod tests {
         assert_eq!(p.address, "portal.anyip.io:1080");
         assert_eq!(p.username, "user_2930d5,type_residential,country_US");
         assert_eq!(p.password, "8198c6");
+    }
+
+    #[test]
+    fn test_socks5_proxy_address_from_backend_url() {
+        // Production backend → api.proxybase.xyz:1082
+        assert_eq!(
+            socks5_proxy_address("https://api.proxybase.xyz"),
+            "api.proxybase.xyz:1082"
+        );
+        // Trailing slash tolerated
+        assert_eq!(
+            socks5_proxy_address("https://api.proxybase.xyz/"),
+            "api.proxybase.xyz:1082"
+        );
+        // Dev backend → localhost:1082
+        assert_eq!(
+            socks5_proxy_address("http://localhost:8080"),
+            "localhost:1082"
+        );
+        // No scheme → treated as http://
+        assert_eq!(
+            socks5_proxy_address("api.proxybase.xyz"),
+            "api.proxybase.xyz:1082"
+        );
+        // Garbage → safe default
+        assert_eq!(socks5_proxy_address(""), "127.0.0.1:1082");
+    }
+
+    #[test]
+    fn test_bridge_state_roundtrip() {
+        let state = BridgeState {
+            session_id: "abc-123".to_string(),
+            port: 4321,
+            pid: 999,
+            backend_url: "https://api.proxybase.xyz".to_string(),
+            upstream_addr: "api.proxybase.xyz:1082".to_string(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: BridgeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.session_id, "abc-123");
+        assert_eq!(parsed.port, 4321);
+        assert_eq!(parsed.pid, 999);
+        assert_eq!(parsed.upstream_addr, "api.proxybase.xyz:1082");
+    }
+
+    #[test]
+    fn test_market_keepalive_parsing() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "keepalive",
+            "--id",
+            "session-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Keepalive { id, loop_ } } => {
+                assert_eq!(id, "session-1");
+                assert!(!loop_);
+            }
+            _ => panic!("expected market keepalive"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "keepalive",
+            "--id",
+            "session-1",
+            "--loop",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Keepalive { id, loop_ } } => {
+                assert_eq!(id, "session-1");
+                assert!(loop_);
+            }
+            _ => panic!("expected market keepalive --loop"),
+        }
+    }
+
+    #[test]
+    fn test_bridge_start_parsing() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "bridge",
+            "start",
+            "session-1",
+            "--port",
+            "8080",
+            "--foreground",
+            "--upstream",
+            "api.proxybase.xyz:1082",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Bridge { cmd: BridgeCmd::Start { session_id, port, upstream, foreground } } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(port, Some(8080));
+                assert!(foreground);
+                assert_eq!(upstream.as_deref(), Some("api.proxybase.xyz:1082"));
+            }
+            _ => panic!("expected bridge start"),
+        }
+    }
+
+    #[test]
+    fn test_market_buy_bridge_flag_parsing() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "buy",
+            "--country",
+            "US",
+            "--network-type",
+            "residential",
+            "--bridge",
+            "--bridge-port",
+            "9000",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Buy { bridge, bridge_port, .. } } => {
+                assert!(bridge);
+                assert_eq!(bridge_port, Some(9000));
+            }
+            _ => panic!("expected market buy"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "buy",
+            "--country",
+            "US",
+            "--network-type",
+            "residential",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Buy { bridge, bridge_port, .. } } => {
+                assert!(!bridge);
+                assert_eq!(bridge_port, None);
+            }
+            _ => panic!("expected market buy"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keepalive_session_success_and_error() {
+        // Minimal HTTP server: 200 for the alive session's keepalive endpoint,
+        // 410 Gone for anything else.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let (status, body) =
+                        if first_line.starts_with("POST /v2/sessions/alive-session/keepalive") {
+                            ("200 OK", r#"{"session_id":"alive-session","status":"alive"}"#)
+                        } else {
+                            ("410 Gone", r#"{"error":"Session is no longer active"}"#)
+                        };
+                    let resp = format!(
+                        "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = BackendClient::new(&format!("http://{}", addr));
+
+        // Success path
+        let resp = client
+            .keepalive_session("alive-session")
+            .await
+            .expect("keepalive must succeed");
+        assert_eq!(resp.get("status").and_then(|v| v.as_str()), Some("alive"));
+
+        // Error path: a 410 surfaces as an anyhow error carrying the status
+        let err = client
+            .keepalive_session("dead-session")
+            .await
+            .expect_err("keepalive of an inactive session must fail");
+        assert!(err.to_string().contains("410"), "error was: {err}");
+
+        server.abort();
     }
 
     #[test]

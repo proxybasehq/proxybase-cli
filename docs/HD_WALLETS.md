@@ -120,7 +120,9 @@ The operator's on-disk wallet and session token are left untouched.
 
 ## Container runtime
 
-The image (`ghcr.io/proxybasehq/proxybase-cli`) entrypoint
+The image (`ghcr.io/proxybasehq/proxybase-cli`) is multi-arch
+(`linux/amd64` + `linux/arm64`), so ARM nodes (Raspberry Pi, ARM servers,
+cloud ARM instances) pull it natively. The entrypoint
 (`docker-entrypoint.sh`) supports two modes:
 
 - **HD mode** — when `MASTER_MNEMONIC` is provided (env, `/etc/secrets/master-mnemonic`,

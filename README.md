@@ -30,7 +30,7 @@ cargo build --release
 
 This repository includes two workflows:
 
-- CI workflow: builds the CLI on Linux x86_64, Windows x86_64, and macOS (Apple Silicon)
+- CI workflow: builds the CLI on Linux x86_64, Linux ARM64 (aarch64), Windows x86_64, and macOS (Apple Silicon)
 - Release workflow: builds release artifacts for all targets and publishes them to a GitHub Release
 
 ## Release
@@ -51,7 +51,7 @@ proxybase-cli update           # install the latest release
 proxybase-cli update --check   # only report whether a new version exists
 ```
 
-Supported platforms: Linux x86_64, Windows x86_64, macOS (Apple Silicon).
+Supported platforms: Linux x86_64, Linux ARM64 (aarch64), Windows x86_64, macOS (Apple Silicon).
 
 Every other command also checks for updates once per day and prints a notice to stderr when a newer version is available.
 
