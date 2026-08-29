@@ -263,9 +263,11 @@ fn print_session_credentials(sid: &str, token: &str, proxy_addr: &str, backend_u
 // Seller config persistence (for daemon / reboot survival)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct SellerConfig {
+    #[serde(default)]
     upstream_proxies: Vec<UpstreamProxyConfig>,
+    #[serde(default)]
     no_direct: bool,
     /// Volunteer mode: donate bandwidth without earnings.
     /// Defaulted so configs written by older CLI versions still load.
@@ -297,9 +299,18 @@ fn save_seller_config(config: &SellerConfig) -> Result<()> {
 
 fn load_seller_config() -> Result<SellerConfig> {
     let path = seller_config_path();
+    if !path.exists() {
+        let default_config = SellerConfig::default();
+        let _ = save_seller_config(&default_config);
+        return Ok(default_config);
+    }
     let content = std::fs::read_to_string(&path)
-        .context("No saved seller config. Run 'seller start --upstream ...' first to save configuration.")?;
+        .context("Failed to read seller_config.json")?;
     Ok(serde_json::from_str(&content)?)
+}
+
+fn load_seller_config_or_default() -> SellerConfig {
+    load_seller_config().unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,39 +1605,41 @@ async fn main() -> Result<()> {
                         eprintln!("Warning: --upstream, --upstream-user, --upstream-pass counts differ. Using {} proxy(s).", n);
                     }
 
-                    // Save config if upstream args provided (so daemon can restart without args).
+                    // Save config if explicit args provided (so daemon can restart without args).
                     // Volunteer mode is also persisted so the daemon keeps donating
                     // bandwidth after restart.
                     let has_upstream_args = !upstream_hosts.is_empty() || !upstream_users.is_empty() || !upstream_passes.is_empty();
-                    if has_upstream_args || volunteer {
-                        if has_upstream_args {
-                            let config = SellerConfig {
-                                upstream_proxies: proxies.iter().map(|p| UpstreamProxyConfig {
+                    let has_explicit_args = has_upstream_args || volunteer || no_direct;
+
+                    let config = if has_explicit_args {
+                        let cfg = SellerConfig {
+                            upstream_proxies: if has_upstream_args {
+                                proxies.iter().map(|p| UpstreamProxyConfig {
                                     address: p.address.clone(),
                                     username: p.username.clone(),
                                     password: p.password.clone(),
                                     country: p.country.clone(),
                                     proxy_category: p.proxy_category.clone(),
-                                }).collect(),
-                                no_direct,
-                                volunteer,
-                            };
-                            save_seller_config(&config)?;
-                        } else {
-                            // Volunteer-only start: keep any previously saved upstreams.
-                            let mut config = load_seller_config().unwrap_or(SellerConfig {
-                                upstream_proxies: vec![],
-                                no_direct,
-                                volunteer,
-                            });
-                            config.volunteer = volunteer;
-                            save_seller_config(&config)?;
+                                }).collect()
+                            } else {
+                                load_seller_config_or_default().upstream_proxies
+                            },
+                            no_direct,
+                            volunteer,
+                        };
+                        save_seller_config(&cfg)?;
+                        cfg
+                    } else {
+                        // Direct-only default start (or foreground service manager start):
+                        // load saved config or create and persist default direct-only config.
+                        let cfg = load_seller_config_or_default();
+                        if !seller_config_path().exists() {
+                            let _ = save_seller_config(&cfg);
                         }
-                    }
+                        cfg
+                    };
 
-                    let (proxies, include_direct, volunteer_mode) = if foreground {
-                        // Service manager flow: load saved config
-                        let config = load_seller_config()?;
+                    let (proxies, include_direct, volunteer_mode) = {
                         let p: Vec<UpstreamProxy> = config.upstream_proxies.iter().map(|u| UpstreamProxy {
                             address: u.address.clone(),
                             username: u.username.clone(),
@@ -1636,8 +1649,6 @@ async fn main() -> Result<()> {
                         }).collect();
                         let include = !config.no_direct;
                         (p, include, config.volunteer)
-                    } else {
-                        (proxies, !no_direct, volunteer)
                     };
 
                     let total_paths = proxies.len() + if include_direct { 1 } else { 0 };
@@ -2086,6 +2097,14 @@ mod tests {
         assert_eq!(paths[2].0, "upstream_1");
         assert_eq!(paths[3].0, "upstream_2");
         assert_eq!(paths[2].1.as_ref().unwrap().address, "proxy2:1081");
+    }
+
+    #[test]
+    fn test_seller_config_default_direct_only() {
+        let default_cfg = SellerConfig::default();
+        assert!(default_cfg.upstream_proxies.is_empty());
+        assert!(!default_cfg.no_direct, "default config must include direct path");
+        assert!(!default_cfg.volunteer, "default config is non-volunteer");
     }
 
     #[test]
