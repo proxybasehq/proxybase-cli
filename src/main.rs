@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod update;
+mod bridge;
+mod proxy_parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
@@ -57,6 +59,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: MarketCmd,
     },
+    /// Local SOCKS5 bridge for buyer sessions
+    Bridge {
+        #[command(subcommand)]
+        cmd: BridgeCmd,
+    },
     /// Backend health check
     Health,
     /// Print version
@@ -110,9 +117,9 @@ enum WalletCmd {
 #[derive(Subcommand)]
 enum SellerCmd {
     /// Start selling bandwidth (daemonizes by default, use --foreground to keep in terminal).
-    /// Add --upstream to resell external proxies simultaneously.
+    /// Add --upstream or --upstream-file to resell external proxies simultaneously.
     Start {
-        /// Upstream proxy host:port (repeatable, pairs with --upstream-user/--upstream-pass)
+        /// Upstream proxy host:port or connection string (repeatable)
         #[arg(long = "upstream")]
         upstream_hosts: Vec<String>,
         /// Upstream proxy username (repeatable, pairs with --upstream)
@@ -121,6 +128,12 @@ enum SellerCmd {
         /// Upstream proxy password (repeatable, pairs with --upstream)
         #[arg(long = "upstream-pass")]
         upstream_passes: Vec<String>,
+        /// Path to a file containing upstream proxies (one per line), or '-' for stdin
+        #[arg(long = "upstream-file", short = 'f')]
+        upstream_file: Option<std::path::PathBuf>,
+        /// Fail on any invalid proxy line in upstream file (default: skip with warning)
+        #[arg(long = "upstream-strict")]
+        upstream_strict: bool,
         /// Disable direct (own bandwidth). Only use --upstream proxies.
         #[arg(long)]
         no_direct: bool,
@@ -135,6 +148,26 @@ enum SellerCmd {
     Stop,
     /// Show seller status (daemon + backend stats)
     Status,
+    /// Parse and validate an upstream proxy file without starting the seller
+    ParseUpstreams {
+        /// Path to proxy file or '-' for stdin
+        file: std::path::PathBuf,
+        /// Output formatted report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Test TCP connection and latency to upstream SOCKS5 proxies
+    TestUpstreams {
+        /// Path to proxy file or '-' for stdin
+        #[arg(short = 'f', long = "upstream-file")]
+        file: Option<std::path::PathBuf>,
+        /// Inline upstream proxies (repeatable)
+        #[arg(long = "upstream")]
+        upstream: Vec<String>,
+        /// Connection timeout in seconds
+        #[arg(long, default_value = "5")]
+        timeout: u64,
+    },
     /// Manage payouts
     Payout {
         #[command(subcommand)]
@@ -200,53 +233,86 @@ enum DepositCmd {
 }
 
 /// Upstream SOCKS5 proxy for resell.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct UpstreamProxy {
     address: String,
-    username: String,
-    password: String,
-    /// Parsed from --upstream-user (e.g. "type_residential" → "residential").
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    /// Parsed from --upstream-user (e.g. "type_residential" → "residential") or query parameters.
     country: Option<String>,
     proxy_category: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 /// Parse country and proxy_category from an upstream username.
 /// Format: `user_2930d5,type_residential,country_US,session_usresidential`
 /// Extracts: country="US", proxy_category="residential"
 fn parse_upstream_metadata(username: &str) -> (Option<String>, Option<String>) {
-    let mut country = None;
-    let mut category = None;
-    for part in username.split(',') {
-        if let Some(c) = part.strip_prefix("country_") {
-            country = Some(c.to_uppercase());
-        } else if let Some(net) = part.strip_prefix("type_") {
-            category = Some(net.to_lowercase());
-        }
-    }
-    (country, category)
+    proxy_parser::parse_upstream_metadata(username)
+}
+
+/// Resolve the remote SOCKS5 gateway address from the backend URL.
+/// The v2 buyer gateway always listens on port 1082 on the same host as the
+/// backend API (127.0.0.1 in dev, api.proxybase.xyz in production).
+fn socks5_proxy_address(backend_url: &str) -> String {
+    let candidate = if backend_url.contains("://") {
+        backend_url.to_string()
+    } else {
+        format!("http://{}", backend_url)
+    };
+    let host = url::Url::parse(&candidate)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    format!("{}:1082", host)
+}
+
+/// Print remote SOCKS5 connection instructions for a session.
+fn print_session_credentials(sid: &str, token: &str, proxy_addr: &str, backend_url: &str) {
+    let base = backend_url.trim_end_matches('/');
+    println!("SOCKS5 proxy: {}", proxy_addr);
+    println!("  Username: {}", sid);
+    println!("  Password: {}", token);
+    println!("");
+    println!("Example:");
+    println!("  curl --socks5 {} --proxy-user {}:{} {}/v2/ip", proxy_addr, sid, token, base);
 }
 
 // ---------------------------------------------------------------------------
 // Seller config persistence (for daemon / reboot survival)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct SellerConfig {
+    #[serde(default)]
     upstream_proxies: Vec<UpstreamProxyConfig>,
+    #[serde(default)]
     no_direct: bool,
     /// Volunteer mode: donate bandwidth without earnings.
     /// Defaulted so configs written by older CLI versions still load.
     #[serde(default)]
     volunteer: bool,
+    /// Optional path to upstream proxy file (if loaded from file)
+    #[serde(default)]
+    upstream_file: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 struct UpstreamProxyConfig {
     address: String,
-    username: String,
-    password: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
     country: Option<String>,
+    #[serde(default)]
     proxy_category: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 fn seller_config_path() -> std::path::PathBuf {
@@ -264,9 +330,149 @@ fn save_seller_config(config: &SellerConfig) -> Result<()> {
 
 fn load_seller_config() -> Result<SellerConfig> {
     let path = seller_config_path();
+    if !path.exists() {
+        let default_config = SellerConfig::default();
+        let _ = save_seller_config(&default_config);
+        return Ok(default_config);
+    }
     let content = std::fs::read_to_string(&path)
-        .context("No saved seller config. Run 'seller start --upstream ...' first to save configuration.")?;
+        .context("Failed to read seller_config.json")?;
     Ok(serde_json::from_str(&content)?)
+}
+
+fn load_seller_config_or_default() -> SellerConfig {
+    load_seller_config().unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Bridge state persistence (one bridge process per buyer session)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct BridgeState {
+    session_id: String,
+    port: u16,
+    pid: u32,
+    backend_url: String,
+    upstream_addr: String,
+}
+
+fn bridge_state_dir() -> std::path::PathBuf {
+    wallet_dir().join("bridges")
+}
+
+fn bridge_state_path(session_id: &str) -> std::path::PathBuf {
+    bridge_state_dir().join(format!("{}.json", session_id))
+}
+
+fn save_bridge_state(state: &BridgeState) -> Result<()> {
+    let path = bridge_state_path(&state.session_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+fn load_bridge_state(session_id: &str) -> Result<BridgeState> {
+    let content = std::fs::read_to_string(bridge_state_path(session_id))?;
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// daemon-kit daemon handle for one session's bridge process. The pid file
+/// lives in the wallet dir next to the seller's (proxybase-bridge-<sid>.pid).
+fn bridge_daemon(session_id: &str) -> daemon_kit::Daemon {
+    let config = daemon_kit::DaemonConfig::new(&format!("proxybase-bridge-{}", session_id))
+        .pid_dir(wallet_dir())
+        .log_file(wallet_dir().join(format!("bridge-{}.log", session_id)))
+        .service_args(vec![
+            "bridge".to_string(),
+            "start".to_string(),
+            session_id.to_string(),
+            "--foreground".to_string(),
+        ])
+        .description("ProxyBase Local SOCKS5 Bridge");
+    daemon_kit::Daemon::new(config)
+}
+
+/// Spawn the bridge as a detached background process (same pattern as
+/// 'seller start'). The child binds the port and writes its state file;
+/// we poll for it so the caller learns the actual bound port.
+async fn start_bridge_background(
+    backend_url: &str,
+    session_id: &str,
+    upstream: &str,
+    port: Option<u16>,
+) -> Result<u16> {
+    let daemon = bridge_daemon(session_id);
+    if daemon.is_running() {
+        if let Ok(state) = load_bridge_state(session_id) {
+            println!(
+                "Bridge for session {} is already running on port {}.",
+                session_id, state.port
+            );
+            return Ok(state.port);
+        }
+        anyhow::bail!(
+            "Bridge daemon already running (PID: {}). Use 'bridge stop {}' first, or 'bridge list'.",
+            daemon.running_pid().unwrap_or(0),
+            session_id
+        );
+    }
+
+    // Clear stale state from a previous run so the poll below only succeeds
+    // once THIS child has reported its port.
+    let _ = std::fs::remove_file(bridge_state_path(session_id));
+
+    let exe = std::env::current_exe()
+        .context("Cannot determine current executable path")?;
+    let log_path = wallet_dir().join(format!("bridge-{}.log", session_id));
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .context("Cannot open bridge log file")?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("bridge")
+        .arg("start")
+        .arg(session_id)
+        .arg("--foreground")
+        .arg("--backend")
+        .arg(backend_url)
+        .arg("--upstream")
+        .arg(upstream);
+    if let Some(p) = port {
+        cmd.arg("--port").arg(p.to_string());
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file);
+    let child = cmd
+        .spawn()
+        .context("Failed to spawn bridge daemon process")?;
+
+    // The child may take a moment to bind (and may fall back to an ephemeral
+    // port). Poll its state file, then give up and point at the log.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match load_bridge_state(session_id) {
+            Ok(state) if state.pid == child.id() => return Ok(state.port),
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "Bridge process started (PID {}) but did not report its port within 5s. Check {}",
+        child.id(),
+        log_path.display()
+    );
 }
 
 fn seller_daemon() -> daemon_kit::Daemon {
@@ -359,10 +565,22 @@ enum MarketCmd {
         session_type: String,
         #[arg(long)]
         sticky_duration: Option<u64>,
+        /// Also start a local unauthenticated SOCKS5 bridge for the session
+        #[arg(long)]
+        bridge: bool,
+        /// Preferred local port for the --bridge listener
+        #[arg(long)]
+        bridge_port: Option<u16>,
     },
     /// Close a session
     Close {
         session_id: String,
+    },
+    /// Rotate exit node for an active sticky session
+    Rotate {
+        /// Session ID to rotate
+        #[arg(long)]
+        id: String,
     },
     /// List active/past sessions
     Sessions,
@@ -372,6 +590,43 @@ enum MarketCmd {
         #[arg(long)]
         id: String,
     },
+    /// Send a keepalive ping to an active session (prevents the 1h idle timeout)
+    Keepalive {
+        /// Session ID
+        #[arg(long)]
+        id: String,
+        /// Repeat every 5 minutes until interrupted
+        #[arg(long = "loop")]
+        loop_: bool,
+    },
+}
+
+/// Local unauthenticated SOCKS5 bridge for a buyer session. Forwards to the
+/// authenticated remote gateway (username = session id, password = session
+/// token) so apps without SOCKS5 auth support can use the session.
+#[derive(Subcommand)]
+enum BridgeCmd {
+    /// Start a bridge. Daemonizes by default; use --foreground to keep it in
+    /// the terminal (used internally by 'bridge start' in background mode).
+    Start {
+        /// Session ID (from 'market buy')
+        session_id: String,
+        /// Preferred local port (falls back to an ephemeral port if taken)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override the upstream SOCKS5 gateway address (default: derived from --backend)
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Run in foreground (don't daemonize)
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop a running bridge
+    Stop {
+        session_id: String,
+    },
+    /// List running bridges
+    List,
 }
 
 // ---------------------------------------------------------------------------
@@ -415,10 +670,6 @@ impl BackendClient {
 
     fn is_authenticated(&self) -> bool {
         self.token.is_some()
-    }
-
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
     }
 
     // --- Auth ---
@@ -624,10 +875,49 @@ impl BackendClient {
         Ok(resp.json().await?)
     }
 
+    async fn rotate_session(&self, session_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(format!("{}/v2/sessions/{}/rotate", self.base_url, session_id))
+            .header("Authorization", self.bearer())
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("reason")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to rotate session");
+            anyhow::bail!("{}: {}", status, msg);
+        }
+        Ok(body)
+    }
+
     async fn get_session(&self, session_id: &str) -> Result<serde_json::Value> {
         let resp = self.http.get(format!("{}/v2/sessions/{}", self.base_url, session_id))
             .header("Authorization", self.bearer()).send().await?;
         Ok(resp.json().await?)
+    }
+
+    async fn keepalive_session(&self, session_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(format!("{}/v2/sessions/{}/keepalive", self.base_url, session_id))
+            .header("Authorization", self.bearer())
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to send keepalive");
+            anyhow::bail!("{}: {}", status, msg);
+        }
+        Ok(body)
     }
 
     async fn health(&self) -> Result<serde_json::Value> {
@@ -677,29 +967,51 @@ async fn run_stream_relay(
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     )> = match upstream {
         Some(proxy) => {
-            eprintln!("[RELAY {}] Using upstream proxy {} (user={})", sid, proxy.address, proxy.username);
-            // fast-socks5 has no built-in connect timeout (Config::default()
-            // leaves connect_timeout as None), so a dead/stalling upstream
-            // would hold its socket FD forever. Bound the whole handshake.
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(10),
-                fast_socks5::client::Socks5Stream::connect_with_password(
-                    &proxy.address,
-                    target_dest.to_string(),
-                    target_port,
-                    proxy.username.clone(),
-                    proxy.password.clone(),
-                    fast_socks5::client::Config::default(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => {
-                    let (r, w) = tokio::io::split(stream);
-                    Ok((Box::new(r), Box::new(w)))
+            let has_auth = proxy.username.as_ref().map(|u| !u.is_empty()).unwrap_or(false);
+            if has_auth {
+                let u = proxy.username.clone().unwrap_or_default();
+                let p = proxy.password.clone().unwrap_or_default();
+                eprintln!("[RELAY {}] Using upstream proxy {} (user={})", sid, proxy.address, u);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    fast_socks5::client::Socks5Stream::connect_with_password(
+                        &proxy.address,
+                        target_dest.to_string(),
+                        target_port,
+                        u,
+                        p,
+                        fast_socks5::client::Config::default(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        let (r, w) = tokio::io::split(stream);
+                        Ok((Box::new(r), Box::new(w)))
+                    }
+                    Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
+                    Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
                 }
-                Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
-                Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
+            } else {
+                eprintln!("[RELAY {}] Using upstream proxy {} (unauthenticated)", sid, proxy.address);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    fast_socks5::client::Socks5Stream::connect(
+                        &proxy.address,
+                        target_dest.to_string(),
+                        target_port,
+                        fast_socks5::client::Config::default(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        let (r, w) = tokio::io::split(stream);
+                        Ok((Box::new(r), Box::new(w)))
+                    }
+                    Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
+                    Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
+                }
             }
         }
         None => {
@@ -1073,187 +1385,6 @@ async fn try_single_path_connection(
     Ok(())
 }
 
-async fn run_seller_ws_loop(
-    mut client: BackendClient,
-    upstreams: Vec<UpstreamProxy>,
-    include_direct: bool,
-) -> Result<()> {
-    let pool: Vec<Option<UpstreamProxy>> = {
-        let mut v: Vec<Option<UpstreamProxy>> = Vec::new();
-        if include_direct || upstreams.is_empty() { v.push(None); }
-        for u in upstreams { v.push(Some(u)); }
-        v
-    };
-    let pool = std::sync::Arc::new(pool);
-
-    let mut backoff_secs = 1u64;
-    loop {
-        let token = client.token.as_deref().unwrap_or("").to_string();
-        let ws_url = format!(
-            "{}/v2/ws/seller?token={}",
-            client.base_url.replace("http://", "ws://").replace("https://", "wss://"),
-            token
-        );
-
-        println!("Connecting to {} (backoff={}s)...", ws_url, backoff_secs);
-        match try_seller_connection(&ws_url, &token, pool.clone()).await {
-            Ok(()) => {
-                backoff_secs = 1;
-                eprintln!("Disconnected. Reconnecting...");
-            }
-            Err(e) if e.to_string().contains("AUTH_EXPIRED") || e.to_string().contains("401") => {
-                eprintln!("Session token expired or invalid. Re-authenticating...");
-                match re_authenticate(&mut client).await {
-                    Ok(()) => {
-                        eprintln!("Re-authenticated successfully.");
-                        backoff_secs = 1;
-                    }
-                    Err(auth_err) => {
-                        eprintln!("Re-authentication failed: {}. Retrying in {}s...", auth_err, backoff_secs);
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Connection failed: {}. Retrying in {}s...", e, backoff_secs);
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(60);
-            }
-        }
-    }
-}
-
-async fn re_authenticate(client: &mut BackendClient) -> Result<()> {
-    let wm = load_wallet()
-        .context("No wallet found. Cannot re-authenticate.")?;
-    let address = wm.address()
-        .ok_or_else(|| anyhow::anyhow!("Wallet not loaded"))?;
-
-    let challenge = client.auth_challenge(address).await?;
-    let message = format!("{}:{}:{}", address, challenge.nonce, challenge.timestamp);
-    let signature = wm.sign(message.as_bytes())?;
-    let sig_hex = hex::encode(&signature);
-    let public_key_hex = wm.public_key_hex()
-        .ok_or_else(|| anyhow::anyhow!("Cannot get public key"))?;
-
-    let auth = client.auth_verify(&public_key_hex, &challenge.nonce, &challenge.timestamp, &sig_hex).await?;
-    BackendClient::save_token(&auth.session_token);
-    client.token = Some(auth.session_token);
-    Ok(())
-}
-
-async fn try_seller_connection(
-    ws_url: &str,
-    token: &str,
-    pool: std::sync::Arc<Vec<Option<UpstreamProxy>>>,
-) -> Result<()> {
-    let (ws, _resp) = tokio::time::timeout(
-        tokio::time::Duration::from_secs(15),
-        connect_async(ws_url),
-    )
-    .await
-    .context("connect_async timed out after 15s")?
-    .context("Failed to connect WebSocket")?;
-    let conn_id = uuid::Uuid::new_v4().to_string();
-    println!("Connected (conn={}). Press Ctrl+C to stop.", &conn_id[..8]);
-
-    let (mut ws_sink, mut ws_stream) = ws.split();
-
-    // Send auth token as the first message (required by standalone WS listener on port 1081).
-    ws_sink
-        .send(Message::Text(token.to_string()))
-        .await
-        .context("Failed to send auth token")?;
-
-    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let active: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> = Default::default();
-
-    let relay_drain = tokio::spawn(async move {
-        while let Some(msg) = relay_rx.recv().await {
-            if ws_sink.send(msg).await.is_err() { break; }
-        }
-    });
-
-    let mut ping_tick = interval(Duration::from_secs(30));
-    let mut heartbeat_tick = interval(Duration::from_secs(15));
-
-    loop {
-        tokio::select! {
-            _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
-            _ = heartbeat_tick.tick() => {
-                let current_streams = active.lock().await.len() as u32;
-                let hb = serde_json::json!({"type":"heartbeat","active_streams":current_streams,"version":env!("CARGO_PKG_VERSION"),"conn_id":conn_id});
-                let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
-            }
-            msg = ws_stream.next() => {
-                match msg {
-                    Some(Ok(Message::Ping(d))) => { let _ = relay_tx.send(Message::Pong(d)); }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&text) {
-                            // Detect auth-token rejection from the server
-                            if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
-                                return Err(anyhow::anyhow!("AUTH_EXPIRED"));
-                            }
-                            match p.get("type").and_then(|v| v.as_str()) {
-                                Some("relay_data") => {
-                                    if let Some(enc) = p.get("data").and_then(|v| v.as_str()) {
-                                        if let Some(dec) = base64_decode(enc) {
-                                            let streams = active.lock().await;
-                                            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-                                            // Unknown sid: the stream ended on our side before the
-                                            // backend learned about it. Drop — sending to an
-                                            // arbitrary other stream would corrupt its traffic.
-                                            if let Some(s) = streams.get(sid) { let _ = s.send(dec); }
-                                        }
-                                    }
-                                }
-                                Some("stream_open") => {
-                                    let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                                    let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
-                                    let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
-                                    let thost = p.get("target_host").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                    let dest = thost.unwrap_or_else(|| tip.clone());
-                                    // Backend controls routing: use route_index if provided, else hash session_id
-                                    let route_idx = p.get("route_index")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|i| i as usize);
-                                    eprintln!("[STREAM] {} → {}:{} (direct_ip={})", sid, dest, tport, tip);
-
-                                    let streams = active.clone();
-                                    let tx = relay_tx.clone();
-                                    let idx = route_idx.unwrap_or_else(|| {
-                                        let mut h: usize = 0;
-                                        for b in sid.as_bytes() { h = h.wrapping_mul(31).wrapping_add(*b as usize); }
-                                        h % pool.len()
-                                    });
-                                    let up = pool[idx].clone();
-
-                                    let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                                    streams.lock().await.insert(sid.clone(), tcp_tx);
-
-                                    tokio::spawn(async move {
-                                        let up_ref: Option<&UpstreamProxy> = up.as_ref();
-                                        run_stream_relay(&dest, &tip, tport, up_ref, &tx, tcp_rx, &sid).await;
-                                        streams.lock().await.remove(&sid);
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => { eprintln!("Backend closed connection"); break; }
-                    Some(Err(e)) => { eprintln!("WS error: {}", e); break; }
-                    _ => {}
-                }
-            }
-        }
-    }
-    relay_drain.abort();
-    Ok(())
-}
-
 /// Shared client state directory. PROXYBASE_DIR (containers, isolated scratch
 /// runs) wins over the default ~/.proxybase.
 fn data_dir() -> std::path::PathBuf {
@@ -1319,6 +1450,9 @@ async fn authenticate(client: &BackendClient, wm: &libproxybase::WalletManager) 
 
     BackendClient::save_token(&auth.session_token);
     println!("Authenticated as: {}", auth.wallet_address);
+    println!("  Role: {}", auth.role);
+    println!("  Buyer available: {} microcredits", auth.buyer_available);
+    println!("  Spendable balance: {} microcredits", auth.spendable_balance);
     println!("Session token saved.");
 
     Ok(auth.session_token)
@@ -1475,8 +1609,144 @@ async fn main() -> Result<()> {
 
         // --- Seller ---
         Commands::Seller { cmd } => {
-            // Daemon-only commands (no auth required)
-            match cmd {
+            // Standalone inspection / diagnostic / daemon commands (no auth required)
+            match &cmd {
+                SellerCmd::ParseUpstreams { file, json } => {
+                    let report = if file == std::path::Path::new("-") {
+                        proxy_parser::parse_proxy_stdin()?
+                    } else {
+                        proxy_parser::parse_proxy_file(file)?
+                    };
+
+                    if *json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        return Ok(());
+                    }
+
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+                    println!(" Upstream SOCKS5 Proxy Parsing Report");
+                    println!(" Source: {}", file.display());
+                    println!(" Total lines: {} | Parsed: {} | Skipped/Comments: {} | Duplicates: {} | Warnings: {}",
+                        report.total_lines,
+                        report.parsed_count,
+                        report.skipped_empty_or_comments,
+                        report.duplicates_deduplicated,
+                        report.warnings.len(),
+                    );
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+
+                    if !report.proxies.is_empty() {
+                        println!("{:<4} {:<30} {:<18} {:<10} {:<14} {:<15}", "#", "Address", "Auth", "Country", "Category", "Label");
+                        println!("{:-<4} {:-<30} {:-<18} {:-<10} {:-<14} {:-<15}", "", "", "", "", "", "");
+                        for (i, p) in report.proxies.iter().enumerate() {
+                            let auth_str = match (&p.username, &p.password) {
+                                (Some(u), Some(_)) => format!("user: {}", u),
+                                (Some(u), None) => format!("user: {}", u),
+                                _ => "none (open)".to_string(),
+                            };
+                            let auth_display = if auth_str.len() > 17 {
+                                format!("{}…", &auth_str[..16])
+                            } else {
+                                auth_str
+                            };
+                            let country_str = p.country.as_deref().unwrap_or("—");
+                            let cat_str = p.proxy_category.as_deref().unwrap_or("—");
+                            let label_str = p.label.as_deref().unwrap_or("—");
+                            println!("{:<4} {:<30} {:<18} {:<10} {:<14} {:<15}", i + 1, p.address, auth_display, country_str, cat_str, label_str);
+                        }
+                    }
+
+                    if !report.warnings.is_empty() {
+                        println!("\nWarnings ({} line(s) skipped):", report.warnings.len());
+                        for w in &report.warnings {
+                            println!("  [Line {}] {}: {}", w.line_number, w.reason, w.raw_line);
+                        }
+                    }
+                    println!("");
+                    return Ok(());
+                }
+                SellerCmd::TestUpstreams { file, upstream, timeout } => {
+                    let mut parsed_proxies = Vec::new();
+                    if let Some(f) = file {
+                        let report = if f == std::path::Path::new("-") {
+                            proxy_parser::parse_proxy_stdin()?
+                        } else {
+                            proxy_parser::parse_proxy_file(f)?
+                        };
+                        for w in &report.warnings {
+                            eprintln!("Warning: [Line {}] {}: {}", w.line_number, w.reason, w.raw_line);
+                        }
+                        parsed_proxies.extend(report.proxies);
+                    }
+                    for u_str in upstream {
+                        if let Ok(Some(p)) = proxy_parser::parse_proxy_line(u_str) {
+                            parsed_proxies.push(p);
+                        }
+                    }
+
+                    if parsed_proxies.is_empty() {
+                        println!("No proxies provided to test. Specify -f <FILE> or --upstream <PROXY>.");
+                        return Ok(());
+                    }
+
+                    println!("Testing {} upstream SOCKS5 proxy endpoint(s) (timeout: {}s)...", parsed_proxies.len(), timeout);
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+
+                    let timeout_dur = tokio::time::Duration::from_secs(*timeout);
+                    let mut success_count = 0;
+                    let mut fail_count = 0;
+
+                    for (i, p) in parsed_proxies.iter().enumerate() {
+                        let start = std::time::Instant::now();
+                        let res = match (&p.username, &p.password) {
+                            (Some(u), Some(pass)) => {
+                                tokio::time::timeout(
+                                    timeout_dur,
+                                    fast_socks5::client::Socks5Stream::connect_with_password(
+                                        &p.address,
+                                        "1.1.1.1".to_string(),
+                                        80,
+                                        u.clone(),
+                                        pass.clone(),
+                                        fast_socks5::client::Config::default(),
+                                    ),
+                                ).await
+                            }
+                            _ => {
+                                tokio::time::timeout(
+                                    timeout_dur,
+                                    fast_socks5::client::Socks5Stream::connect(
+                                        &p.address,
+                                        "1.1.1.1".to_string(),
+                                        80,
+                                        fast_socks5::client::Config::default(),
+                                    ),
+                                ).await
+                            }
+                        };
+                        let elapsed = start.elapsed();
+
+                        match res {
+                            Ok(Ok(_stream)) => {
+                                success_count += 1;
+                                let country_str = p.country.as_deref().unwrap_or("—");
+                                let cat_str = p.proxy_category.as_deref().unwrap_or("—");
+                                println!("[✓ OK]   #{:<3} {:<28} {:>5}ms (country: {}, type: {})", i + 1, p.address, elapsed.as_millis(), country_str, cat_str);
+                            }
+                            Ok(Err(e)) => {
+                                fail_count += 1;
+                                println!("[✗ FAIL] #{:<3} {:<28} SOCKS5 connect failed: {:?}", i + 1, p.address, e);
+                            }
+                            Err(_) => {
+                                fail_count += 1;
+                                println!("[✗ FAIL] #{:<3} {:<28} Timed out after {}s", i + 1, p.address, timeout);
+                            }
+                        }
+                    }
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+                    println!("Test summary: {}/{} passed, {} failed", success_count, parsed_proxies.len(), fail_count);
+                    return Ok(());
+                }
                 SellerCmd::Stop => {
                     let daemon = seller_daemon();
                     // Stop the running daemon
@@ -1507,67 +1777,147 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Not authenticated. Run 'proxybase-cli login' first.");
             }
             match cmd {
-                SellerCmd::Start { upstream_hosts, upstream_users, upstream_passes, no_direct, volunteer, foreground } => {
-                    // Build proxy list from args
-                    let n = upstream_hosts.len().min(upstream_users.len()).min(upstream_passes.len());
-                    let proxies: Vec<UpstreamProxy> = (0..n).map(|i| {
-                        let (country, proxy_category) = parse_upstream_metadata(&upstream_users[i]);
-                        UpstreamProxy {
-                            address: upstream_hosts[i].clone(),
-                            username: upstream_users[i].clone(),
-                            password: upstream_passes[i].clone(),
-                            country,
-                            proxy_category,
+                SellerCmd::Start {
+                    upstream_hosts,
+                    upstream_users,
+                    upstream_passes,
+                    upstream_file,
+                    upstream_strict,
+                    no_direct,
+                    volunteer,
+                    foreground,
+                } => {
+                    let mut collected_proxies: Vec<UpstreamProxy> = Vec::new();
+                    let mut seen_keys = std::collections::HashSet::new();
+
+                    // 1. Load from file if provided
+                    if let Some(ref file_path) = upstream_file {
+                        let report = if file_path == std::path::Path::new("-") {
+                            proxy_parser::parse_proxy_stdin()?
+                        } else {
+                            proxy_parser::parse_proxy_file(file_path)?
+                        };
+
+                        if !report.warnings.is_empty() {
+                            for w in &report.warnings {
+                                eprintln!("Warning: [Line {}] {}: {}", w.line_number, w.reason, w.raw_line);
+                            }
+                            if upstream_strict {
+                                anyhow::bail!(
+                                    "Aborting seller start due to {} invalid proxy line(s) in upstream file (strict mode)",
+                                    report.warnings.len()
+                                );
+                            }
                         }
-                    }).collect();
-                    if upstream_hosts.len() != n || upstream_users.len() != n || upstream_passes.len() != n {
-                        eprintln!("Warning: --upstream, --upstream-user, --upstream-pass counts differ. Using {} proxy(s).", n);
+
+                        for p in report.proxies {
+                            let key = format!("{}|{}", p.address.to_lowercase(), p.username.as_deref().unwrap_or(""));
+                            if seen_keys.insert(key) {
+                                collected_proxies.push(UpstreamProxy {
+                                    address: p.address,
+                                    username: p.username,
+                                    password: p.password,
+                                    country: p.country,
+                                    proxy_category: p.proxy_category,
+                                    label: p.label,
+                                });
+                            }
+                        }
+                        println!(
+                            "Loaded {} upstream proxy(s) from '{}' ({} skipped comments/blank)",
+                            collected_proxies.len(),
+                            file_path.display(),
+                            report.skipped_empty_or_comments
+                        );
                     }
 
-                    // Save config if upstream args provided (so daemon can restart without args).
-                    // Volunteer mode is also persisted so the daemon keeps donating
-                    // bandwidth after restart.
-                    let has_upstream_args = !upstream_hosts.is_empty() || !upstream_users.is_empty() || !upstream_passes.is_empty();
-                    if has_upstream_args || volunteer {
-                        if has_upstream_args {
-                            let config = SellerConfig {
-                                upstream_proxies: proxies.iter().map(|p| UpstreamProxyConfig {
+                    // 2. Parse inline --upstream arguments (connection strings or separate --upstream-user/pass)
+                    for (i, host_arg) in upstream_hosts.iter().enumerate() {
+                        // If it's a full connection string (e.g. socks5://... or host:port:user:pass)
+                        if let Ok(Some(parsed)) = proxy_parser::parse_proxy_line(host_arg) {
+                            if parsed.username.is_some() || parsed.password.is_some() || upstream_users.is_empty() {
+                                let key = format!("{}|{}", parsed.address.to_lowercase(), parsed.username.as_deref().unwrap_or(""));
+                                if seen_keys.insert(key) {
+                                    collected_proxies.push(UpstreamProxy {
+                                        address: parsed.address,
+                                        username: parsed.username,
+                                        password: parsed.password,
+                                        country: parsed.country,
+                                        proxy_category: parsed.proxy_category,
+                                        label: parsed.label,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+
+                        // Otherwise pair with --upstream-user / --upstream-pass if available
+                        let user_opt = upstream_users.get(i).cloned();
+                        let pass_opt = upstream_passes.get(i).cloned();
+                        let (country, proxy_category) = user_opt.as_deref()
+                            .map(parse_upstream_metadata)
+                            .unwrap_or((None, None));
+
+                        let key = format!("{}|{}", host_arg.to_lowercase(), user_opt.as_deref().unwrap_or(""));
+                        if seen_keys.insert(key) {
+                            collected_proxies.push(UpstreamProxy {
+                                address: host_arg.clone(),
+                                username: user_opt,
+                                password: pass_opt,
+                                country,
+                                proxy_category,
+                                label: None,
+                            });
+                        }
+                    }
+
+                    let has_upstream_args = !upstream_hosts.is_empty()
+                        || !upstream_users.is_empty()
+                        || !upstream_passes.is_empty()
+                        || upstream_file.is_some();
+                    let has_explicit_args = has_upstream_args || volunteer || no_direct;
+
+                    let config = if has_explicit_args {
+                        let cfg = SellerConfig {
+                            upstream_proxies: if has_upstream_args {
+                                collected_proxies.iter().map(|p| UpstreamProxyConfig {
                                     address: p.address.clone(),
                                     username: p.username.clone(),
                                     password: p.password.clone(),
                                     country: p.country.clone(),
                                     proxy_category: p.proxy_category.clone(),
-                                }).collect(),
-                                no_direct,
-                                volunteer,
-                            };
-                            save_seller_config(&config)?;
-                        } else {
-                            // Volunteer-only start: keep any previously saved upstreams.
-                            let mut config = load_seller_config().unwrap_or(SellerConfig {
-                                upstream_proxies: vec![],
-                                no_direct,
-                                volunteer,
-                            });
-                            config.volunteer = volunteer;
-                            save_seller_config(&config)?;
+                                    label: p.label.clone(),
+                                }).collect()
+                            } else {
+                                load_seller_config_or_default().upstream_proxies
+                            },
+                            no_direct,
+                            volunteer,
+                            upstream_file: upstream_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        };
+                        save_seller_config(&cfg)?;
+                        cfg
+                    } else {
+                        // Direct-only default start (or foreground service manager start):
+                        // load saved config or create and persist default direct-only config.
+                        let cfg = load_seller_config_or_default();
+                        if !seller_config_path().exists() {
+                            let _ = save_seller_config(&cfg);
                         }
-                    }
+                        cfg
+                    };
 
-                    let (proxies, include_direct, volunteer_mode) = if foreground {
-                        // Service manager flow: load saved config
-                        let config = load_seller_config()?;
+                    let (proxies, include_direct, volunteer_mode) = {
                         let p: Vec<UpstreamProxy> = config.upstream_proxies.iter().map(|u| UpstreamProxy {
                             address: u.address.clone(),
                             username: u.username.clone(),
                             password: u.password.clone(),
                             country: u.country.clone(),
                             proxy_category: u.proxy_category.clone(),
+                            label: u.label.clone(),
                         }).collect();
                         let include = !config.no_direct;
                         (p, include, config.volunteer)
-                    } else {
-                        (proxies, !no_direct, volunteer)
                     };
 
                     let total_paths = proxies.len() + if include_direct { 1 } else { 0 };
@@ -1657,7 +2007,10 @@ async fn main() -> Result<()> {
                         Err(e) => println!("Backend: unreachable ({e})"),
                     }
                 }
-                SellerCmd::Stop | SellerCmd::Install => {
+                SellerCmd::Stop
+                | SellerCmd::Install
+                | SellerCmd::ParseUpstreams { .. }
+                | SellerCmd::TestUpstreams { .. } => {
                     // Handled above (before auth check)
                     unreachable!();
                 }
@@ -1747,6 +2100,8 @@ async fn main() -> Result<()> {
                     network_type,
                     session_type,
                     sticky_duration: _,
+                    bridge,
+                    bridge_port,
                 } => {
                     let session = client
                         .create_session(&country, &network_type, &session_type, None)
@@ -1754,28 +2109,190 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&session)?);
                     if let Some(sid) = session.get("session_id").and_then(|v| v.as_str()) {
                         let token = client.token.as_deref().unwrap_or("");
+                        let proxy_addr = socks5_proxy_address(&cli.backend);
                         println!("Session {} opened.", sid);
                         println!("");
-                        println!("SOCKS5 proxy: 127.0.0.1:1082");
-                        println!("  Username: {}", sid);
-                        println!("  Password: {}", token);
-                        println!("");
-                        println!("Example:");
-                        println!("  curl --socks5 127.0.0.1:1082 --proxy-user {}:{} http://api.proxybase.xyz/v2/ip", sid, token);
+                        print_session_credentials(sid, token, &proxy_addr, &cli.backend);
+                        if bridge {
+                            let port = start_bridge_background(&cli.backend, sid, &proxy_addr, bridge_port).await?;
+                            println!("");
+                            println!("Local bridge (no auth): 127.0.0.1:{}", port);
+                            println!("Example:");
+                            println!("  curl --socks5 127.0.0.1:{} {}/v2/ip", port, cli.backend.trim_end_matches('/'));
+                        }
                     }
                 }
                 MarketCmd::Close { session_id } => {
                     let result = client.close_session(&session_id).await?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
+                MarketCmd::Rotate { id } => {
+                    let result = client.rotate_session(&id).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
                 MarketCmd::Sessions => {
                     let sessions = client.list_sessions().await?;
                     println!("{}", serde_json::to_string_pretty(&sessions)?);
+                    let entries = sessions
+                        .get("sessions")
+                        .and_then(|s| s.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if !entries.is_empty() {
+                        let proxy_addr = socks5_proxy_address(&cli.backend);
+                        let token = client.token.as_deref().unwrap_or("");
+                        println!("\nActive sessions:");
+                        for s in &entries {
+                            let sid = s.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let country = s.get("country").and_then(|v| v.as_str()).unwrap_or("?");
+                            let network = s.get("network_type").and_then(|v| v.as_str()).unwrap_or("?");
+                            let stype = s.get("session_type").and_then(|v| v.as_str()).unwrap_or("?");
+                            println!("  {}  {} {} {}  →  {} (user {} / pass {})", sid, country, network, stype, proxy_addr, sid, token);
+                        }
+                        if let Some(sid) = entries.first().and_then(|s| s.get("session_id")).and_then(|v| v.as_str()) {
+                            println!("\nExample:");
+                            println!("  curl --socks5 {} --proxy-user {}:{} {}/v2/ip", proxy_addr, sid, token, cli.backend.trim_end_matches('/'));
+                        }
+                    }
                 }
                 MarketCmd::SessionStatus { id } => {
                     let session = client.get_session(&id).await?;
                     println!("{}", serde_json::to_string_pretty(&session)?);
+                    if session.get("status").and_then(|v| v.as_str()) == Some("active") {
+                        let sid = session.get("session_id").and_then(|v| v.as_str()).unwrap_or(id.as_str());
+                        let token = client.token.as_deref().unwrap_or("");
+                        let proxy_addr = socks5_proxy_address(&cli.backend);
+                        println!("");
+                        print_session_credentials(sid, token, &proxy_addr, &cli.backend);
+                    }
                 }
+                MarketCmd::Keepalive { id, loop_ } => {
+                    if loop_ {
+                        let interval_secs = 300u64;
+                        println!("Sending keepalive for session {} every {}s. Press Ctrl+C to stop.", id, interval_secs);
+                        let mut tick = interval(Duration::from_secs(interval_secs));
+                        loop {
+                            tick.tick().await;
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            match client.keepalive_session(&id).await {
+                                Ok(resp) => {
+                                    let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("alive");
+                                    println!("[{}] Session {} keepalive: {}", now, id, status);
+                                }
+                                Err(e) => eprintln!("[{}] Session {} keepalive failed: {}", now, id, e),
+                            }
+                        }
+                    } else {
+                        let resp = client.keepalive_session(&id).await?;
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                        println!("Session {} keepalive sent successfully.", id);
+                    }
+                }
+            }
+        }
+
+        // --- Bridge ---
+        Commands::Bridge { cmd } => match cmd {
+            // Stop/List are daemon-only (no auth required)
+            BridgeCmd::Stop { session_id } => {
+                let daemon = bridge_daemon(&session_id);
+                match daemon.stop() {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(bridge_state_path(&session_id));
+                        println!("Bridge {} stopped.", session_id);
+                    }
+                    Err(daemon_kit::DaemonError::NotRunning) => {
+                        let _ = std::fs::remove_file(bridge_state_path(&session_id));
+                        println!("Bridge {} is not running.", session_id);
+                    }
+                    Err(e) => anyhow::bail!("Failed to stop bridge: {e}"),
+                }
+            }
+            BridgeCmd::List => {
+                let dir = bridge_state_dir();
+                let mut found = false;
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                            continue;
+                        }
+                        let state: BridgeState = match std::fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|c| serde_json::from_str(&c).ok())
+                        {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let daemon = bridge_daemon(&state.session_id);
+                        if daemon.is_running() {
+                            found = true;
+                            println!(
+                                "Session {}: 127.0.0.1:{} (PID {})",
+                                state.session_id,
+                                state.port,
+                                daemon.running_pid().unwrap_or(0)
+                            );
+                        } else {
+                            // Stale state from a killed process — clean it up.
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+                if !found {
+                    println!("No bridges running.");
+                }
+            }
+            BridgeCmd::Start { session_id, port, upstream, foreground } => {
+                if !client.is_authenticated() {
+                    anyhow::bail!("Not authenticated. Run 'proxybase-cli login' first.");
+                }
+                let upstream_addr = upstream.unwrap_or_else(|| socks5_proxy_address(&cli.backend));
+
+                if foreground {
+                    // Bound listener, report port via state file, then run
+                    // until the process is killed (SIGTERM/SIGINT). The OS
+                    // releases the listener socket on exit; 'bridge stop' and
+                    // 'bridge list' clean up stale state.
+                    let local_port = bridge::start_bridge(
+                        &session_id,
+                        &cli.backend,
+                        &upstream_addr,
+                        port,
+                    )
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                    // PID file first so 'bridge stop' can find us the moment
+                    // the parent's state-file poll succeeds.
+                    let _ = std::fs::write(
+                        wallet_dir().join(format!("proxybase-bridge-{}.pid", session_id)),
+                        std::process::id().to_string(),
+                    );
+                    let state = BridgeState {
+                        session_id: session_id.clone(),
+                        port: local_port,
+                        pid: std::process::id(),
+                        backend_url: cli.backend.clone(),
+                        upstream_addr: upstream_addr.clone(),
+                    };
+                    save_bridge_state(&state)?;
+                    println!(
+                        "Bridge for session {} listening on 127.0.0.1:{} (no auth) — PID {}",
+                        session_id,
+                        local_port,
+                        std::process::id()
+                    );
+                    std::future::pending::<()>().await;
+                }
+
+                let local_port = start_bridge_background(&cli.backend, &session_id, &upstream_addr, port).await?;
+                println!("Bridge started for session {}.", session_id);
+                println!("  Local SOCKS5: 127.0.0.1:{} (no auth)", local_port);
+                println!("Example:");
+                println!("  curl --socks5 127.0.0.1:{} {}/v2/ip", local_port, cli.backend.trim_end_matches('/'));
             }
         }
 
@@ -1803,10 +2320,11 @@ mod tests {
     fn make_upstream(addr: &str, user: &str, pass: &str) -> UpstreamProxy {
         UpstreamProxy {
             address: addr.to_string(),
-            username: user.to_string(),
-            password: pass.to_string(),
+            username: Some(user.to_string()),
+            password: Some(pass.to_string()),
             country: None,
             proxy_category: None,
+            label: None,
         }
     }
 
@@ -1852,6 +2370,14 @@ mod tests {
         assert_eq!(paths[2].0, "upstream_1");
         assert_eq!(paths[3].0, "upstream_2");
         assert_eq!(paths[2].1.as_ref().unwrap().address, "proxy2:1081");
+    }
+
+    #[test]
+    fn test_seller_config_default_direct_only() {
+        let default_cfg = SellerConfig::default();
+        assert!(default_cfg.upstream_proxies.is_empty());
+        assert!(!default_cfg.no_direct, "default config must include direct path");
+        assert!(!default_cfg.volunteer, "default config is non-volunteer");
     }
 
     #[test]
@@ -1902,8 +2428,204 @@ mod tests {
         let paths = build_paths(&upstreams, false);
         let p = paths[0].1.as_ref().unwrap();
         assert_eq!(p.address, "portal.anyip.io:1080");
-        assert_eq!(p.username, "user_2930d5,type_residential,country_US");
-        assert_eq!(p.password, "8198c6");
+        assert_eq!(p.username.as_deref(), Some("user_2930d5,type_residential,country_US"));
+        assert_eq!(p.password.as_deref(), Some("8198c6"));
+    }
+
+    #[test]
+    fn test_socks5_proxy_address_from_backend_url() {
+        // Production backend → api.proxybase.xyz:1082
+        assert_eq!(
+            socks5_proxy_address("https://api.proxybase.xyz"),
+            "api.proxybase.xyz:1082"
+        );
+        // Trailing slash tolerated
+        assert_eq!(
+            socks5_proxy_address("https://api.proxybase.xyz/"),
+            "api.proxybase.xyz:1082"
+        );
+        // Dev backend → localhost:1082
+        assert_eq!(
+            socks5_proxy_address("http://localhost:8080"),
+            "localhost:1082"
+        );
+        // No scheme → treated as http://
+        assert_eq!(
+            socks5_proxy_address("api.proxybase.xyz"),
+            "api.proxybase.xyz:1082"
+        );
+        // Garbage → safe default
+        assert_eq!(socks5_proxy_address(""), "127.0.0.1:1082");
+    }
+
+    #[test]
+    fn test_bridge_state_roundtrip() {
+        let state = BridgeState {
+            session_id: "abc-123".to_string(),
+            port: 4321,
+            pid: 999,
+            backend_url: "https://api.proxybase.xyz".to_string(),
+            upstream_addr: "api.proxybase.xyz:1082".to_string(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: BridgeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.session_id, "abc-123");
+        assert_eq!(parsed.port, 4321);
+        assert_eq!(parsed.pid, 999);
+        assert_eq!(parsed.upstream_addr, "api.proxybase.xyz:1082");
+    }
+
+    #[test]
+    fn test_market_keepalive_parsing() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "keepalive",
+            "--id",
+            "session-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Keepalive { id, loop_ } } => {
+                assert_eq!(id, "session-1");
+                assert!(!loop_);
+            }
+            _ => panic!("expected market keepalive"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "keepalive",
+            "--id",
+            "session-1",
+            "--loop",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Keepalive { id, loop_ } } => {
+                assert_eq!(id, "session-1");
+                assert!(loop_);
+            }
+            _ => panic!("expected market keepalive --loop"),
+        }
+    }
+
+    #[test]
+    fn test_bridge_start_parsing() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "bridge",
+            "start",
+            "session-1",
+            "--port",
+            "8080",
+            "--foreground",
+            "--upstream",
+            "api.proxybase.xyz:1082",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Bridge { cmd: BridgeCmd::Start { session_id, port, upstream, foreground } } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(port, Some(8080));
+                assert!(foreground);
+                assert_eq!(upstream.as_deref(), Some("api.proxybase.xyz:1082"));
+            }
+            _ => panic!("expected bridge start"),
+        }
+    }
+
+    #[test]
+    fn test_market_buy_bridge_flag_parsing() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "buy",
+            "--country",
+            "US",
+            "--network-type",
+            "residential",
+            "--bridge",
+            "--bridge-port",
+            "9000",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Buy { bridge, bridge_port, .. } } => {
+                assert!(bridge);
+                assert_eq!(bridge_port, Some(9000));
+            }
+            _ => panic!("expected market buy"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "market",
+            "buy",
+            "--country",
+            "US",
+            "--network-type",
+            "residential",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Market { cmd: MarketCmd::Buy { bridge, bridge_port, .. } } => {
+                assert!(!bridge);
+                assert_eq!(bridge_port, None);
+            }
+            _ => panic!("expected market buy"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keepalive_session_success_and_error() {
+        // Minimal HTTP server: 200 for the alive session's keepalive endpoint,
+        // 410 Gone for anything else.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let (status, body) =
+                        if first_line.starts_with("POST /v2/sessions/alive-session/keepalive") {
+                            ("200 OK", r#"{"session_id":"alive-session","status":"alive"}"#)
+                        } else {
+                            ("410 Gone", r#"{"error":"Session is no longer active"}"#)
+                        };
+                    let resp = format!(
+                        "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = BackendClient::new(&format!("http://{}", addr));
+
+        // Success path
+        let resp = client
+            .keepalive_session("alive-session")
+            .await
+            .expect("keepalive must succeed");
+        assert_eq!(resp.get("status").and_then(|v| v.as_str()), Some("alive"));
+
+        // Error path: a 410 surfaces as an anyhow error carrying the status
+        let err = client
+            .keepalive_session("dead-session")
+            .await
+            .expect_err("keepalive of an inactive session must fail");
+        assert!(err.to_string().contains("410"), "error was: {err}");
+
+        server.abort();
     }
 
     #[test]

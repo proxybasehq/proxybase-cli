@@ -66,6 +66,7 @@ fn is_newer(latest: &semver::Version) -> bool {
 fn asset_for(arch: &str, os: &str) -> Option<&'static str> {
     match (arch, os) {
         ("x86_64", "linux") => Some("proxybase-cli-x86_64-unknown-linux-gnu"),
+        ("aarch64", "linux") => Some("proxybase-cli-aarch64-unknown-linux-gnu"),
         ("x86_64", "windows") => Some("proxybase-cli-x86_64-pc-windows-msvc.exe"),
         ("aarch64", "macos") => Some("proxybase-cli-aarch64-apple-darwin"),
         _ => None,
@@ -217,7 +218,7 @@ pub async fn run_update(check_only: bool) -> Result<()> {
         Some(n) => n.to_string(),
         None => {
             println!(
-                "No release for your platform ({} {}). Supported: linux x86_64, windows x86_64, macos aarch64 (Apple Silicon).",
+                "No release for your platform ({} {}). Supported: linux x86_64, linux aarch64 (ARM64), windows x86_64, macos aarch64 (Apple Silicon).",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             );
@@ -414,10 +415,11 @@ mod tests {
     #[test]
     fn test_asset_for() {
         assert_eq!(asset_for("x86_64", "linux"), Some("proxybase-cli-x86_64-unknown-linux-gnu"));
+        assert_eq!(asset_for("aarch64", "linux"), Some("proxybase-cli-aarch64-unknown-linux-gnu"));
         assert_eq!(asset_for("x86_64", "windows"), Some("proxybase-cli-x86_64-pc-windows-msvc.exe"));
         assert_eq!(asset_for("aarch64", "macos"), Some("proxybase-cli-aarch64-apple-darwin"));
         assert_eq!(asset_for("x86_64", "macos"), None, "Intel macOS is not published");
-        assert_eq!(asset_for("aarch64", "linux"), None);
+        assert_eq!(asset_for("aarch64", "freebsd"), None);
         assert_eq!(asset_for("x86_64", "freebsd"), None);
     }
 

@@ -71,13 +71,16 @@ else
         echo "[init] Session token missing — logging in..."
         proxybase-cli --backend "${BACKEND_URL}" login
     fi
-    CONFIG_FILE="${DATA_DIR}/seller_config.json"
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "[init] Creating default seller config (direct-only)..."
-        cat > "$CONFIG_FILE" <<'JSON'
+fi
+
+# Ensure default seller config exists if not present (direct-only)
+CONFIG_FILE="${DATA_DIR}/seller_config.json"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "[init] Creating default seller config (direct-only)..."
+    mkdir -p "${DATA_DIR}"
+    cat > "$CONFIG_FILE" <<'JSON'
 {"upstream_proxies":[],"no_direct":false}
 JSON
-    fi
 fi
 
 # -----------------------------------------------------------

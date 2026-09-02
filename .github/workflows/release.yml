@@ -22,6 +22,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_ext: tar.gz
             exe_suffix: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_ext: tar.gz
+            exe_suffix: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_ext: zip
@@ -109,6 +113,7 @@ jobs:
         run: |
           cd dist
           sha256sum proxybase-cli-x86_64-unknown-linux-gnu \
+                    proxybase-cli-aarch64-unknown-linux-gnu \
                     proxybase-cli-x86_64-pc-windows-msvc.exe \
                     proxybase-cli-aarch64-apple-darwin > SHA256SUMS
 
