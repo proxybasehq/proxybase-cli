@@ -178,21 +178,45 @@ proxybase-cli seller start [OPTIONS]
 
 | Flag | Description |
 |---|---|
-| `--upstream <HOST:PORT>` | Upstream SOCKS5 proxy address (e.g. `proxy.vendor.com:1080`). Repeatable. |
-| `--upstream-user <USER>` | Username for the paired `--upstream` proxy. Repeatable. |
-| `--upstream-pass <PASS>` | Password for the paired `--upstream` proxy. Repeatable. |
+| Flag | Description |
+|---|---|
+| `-f, --upstream-file <PATH>` | Path to a text file containing upstream proxies (one per line), or `-` for stdin. |
+| `--upstream-strict` | Fail on any invalid proxy line in upstream file (default: skip with warning). |
+| `--upstream <ADDR_OR_URI>` | Upstream SOCKS5 address (`host:port`) or connection string (`socks5://user:pass@host:port` or `host:port:user:pass`). Repeatable. |
+| `--upstream-user <USER>` | Username for paired `--upstream` address. Repeatable. |
+| `--upstream-pass <PASS>` | Password for paired `--upstream` address. Repeatable. |
 | `--no-direct` | Disable node's direct bandwidth. Only relay through `--upstream` proxies. |
 | `--volunteer` | Run in volunteer mode (donate bandwidth unpaid, 0 seller share). |
 | `--foreground` | Keep process running in the terminal instead of daemonizing to background. |
 | `--backend <URL>` | Override backend API URL (default: `https://api.proxybase.xyz`). |
 
-#### Management Commands
+#### Diagnostic & Management Commands
 
+- `proxybase-cli seller parse-upstreams <FILE>` — Dry-run parser on a proxy file (or `-` for stdin) and display a structured report or `--json`.
+- `proxybase-cli seller test-upstreams [-f <FILE>] [--upstream <PROXY>]` — Test live SOCKS5 connectivity and measure latency to each upstream proxy before starting.
 - `proxybase-cli seller status` — Inspect background daemon PID, node type, and live backend pool statistics.
 - `proxybase-cli seller stop` — Stop the background seller daemon (sends `SIGTERM`, escalates to `SIGKILL` after 5s) and remove any autostart service.
 - `proxybase-cli seller install` — Install seller daemon as a persistent OS service (`systemd` on Linux, `launchd` on macOS) that automatically boots on system startup.
 - `proxybase-cli seller payout create --amount <microcredits> --tempo-address <address>` — Lock accrued earnings for withdrawal (1,000,000 microcredits = $1.00 USD).
 - `proxybase-cli seller payout list` — View payout transaction history and on-chain status.
+
+---
+
+### Supported Connection String Formats
+
+The parser automatically detects and normalizes all major proxy formats:
+
+1. **Standard URI Format**:
+   - `socks5://user:pass@proxy.example.com:1080`
+   - `socks5h://user:pass@proxy.example.com:1080` (remote DNS resolution)
+   - `socks5://127.0.0.1:9050` (unauthenticated local proxy / Tor)
+   - `socks5://user:pass@gate.net:1080?country=US&type=residential#us-east-1` (with query metadata & fragment label)
+2. **Delimited 4-Tuple (Host-First)**: `host:port:user:pass` (standard provider export format)
+3. **Delimited 4-Tuple (Auth-First)**: `user:pass@host:port` or `user:pass:host:port`
+4. **Unauthenticated 2-Tuple**: `host:port` (e.g. `127.0.0.1:9050`)
+5. **IPv6 Proxies**: `[2001:db8::1]:1080:user:pass` or `socks5://user:pass@[2001:db8::1]:1080`
+6. **Alternative Delimiters**: Semicolon (`;`), pipe (`|`), comma (`,`), and tab (`\t`)
+7. **Comments & Sanitation**: Full-line comments (`#` or `//`), inline comments (`host:port:user:pass # label`), empty lines, and UTF-8 BOM are automatically handled.
 
 ---
 
@@ -204,43 +228,45 @@ Monetize your local device's internet connection:
 proxybase-cli seller start
 ```
 
-#### 2. Single Upstream Proxy
-Resell access through an external SOCKS5 proxy while keeping local bandwidth active:
+#### 2. Load Bulk Upstream Proxies from a File
+Load dozens or hundreds of upstream proxies from a file:
 ```bash
-proxybase-cli seller start \
-  --upstream residential.proxyprovider.net:8000 \
-  --upstream-user resi_user_102 \
-  --upstream-pass secretpassword123
+proxybase-cli seller start -f /path/to/proxies.txt --no-direct
 ```
 
-#### 3. Multiple Upstream Proxies (Hybrid Pool)
+#### 3. Pipe Proxies from Stdin
+Integrate with curl, password managers, or external APIs:
+```bash
+cat proxies.txt | proxybase-cli seller start -f -
+curl -s https://my-proxy-provider.com/list.txt | proxybase-cli seller start -f -
+```
+
+#### 4. Dry-Run Parse & Test Upstream Proxies
+Validate a proxy list before deploying:
+```bash
+# Preview parsed proxies in a table
+proxybase-cli seller parse-upstreams ./proxies.txt
+
+# Test connectivity and measure handshake latency
+proxybase-cli seller test-upstreams -f ./proxies.txt --timeout 5
+```
+
+#### 5. Single Upstream Connection String via CLI
+Resell access through an external SOCKS5 proxy using standard URI format:
+```bash
+proxybase-cli seller start \
+  --upstream "socks5://user_2930d5,country_US,type_residential:pass123@residential.provider.net:8000"
+```
+
+#### 6. Multiple Upstream Proxies (Hybrid Pool)
 Run multiple upstream proxies and direct bandwidth concurrently:
 ```bash
 proxybase-cli seller start \
-  --upstream us-east.provider.com:1080 --upstream-user userA --upstream-pass passA \
-  --upstream eu-west.provider.com:1080 --upstream-user userB --upstream-pass passB \
-  --upstream ap-south.provider.com:1080 --upstream-user userC --upstream-pass passC
+  --upstream us-east.provider.com:1080:userA:passA \
+  --upstream eu-west.provider.com:1080:userB:passB \
+  --upstream ap-south.provider.com:1080:userC:passC
 ```
 *The CLI will spawn 4 independent paths: `direct`, `upstream_0`, `upstream_1`, and `upstream_2`.*
-
-#### 4. Resell Upstream Proxies ONLY (Zero Direct Bandwidth)
-Do not expose or route traffic through the host server's local IP:
-```bash
-proxybase-cli seller start \
-  --no-direct \
-  --upstream socks5.premiumprovider.com:9050 \
-  --upstream-user customer456 \
-  --upstream-pass tokenXYZ
-```
-
-#### 5. Run in Foreground (Debugging & Containers)
-Keep standard output attached to inspect live connection events and traffic logs:
-```bash
-proxybase-cli seller start --foreground \
-  --upstream 10.0.0.50:1080 \
-  --upstream-user proxyuser \
-  --upstream-pass proxypass
-```
 
 ---
 

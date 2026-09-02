@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod update;
 mod bridge;
+mod proxy_parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
@@ -116,9 +117,9 @@ enum WalletCmd {
 #[derive(Subcommand)]
 enum SellerCmd {
     /// Start selling bandwidth (daemonizes by default, use --foreground to keep in terminal).
-    /// Add --upstream to resell external proxies simultaneously.
+    /// Add --upstream or --upstream-file to resell external proxies simultaneously.
     Start {
-        /// Upstream proxy host:port (repeatable, pairs with --upstream-user/--upstream-pass)
+        /// Upstream proxy host:port or connection string (repeatable)
         #[arg(long = "upstream")]
         upstream_hosts: Vec<String>,
         /// Upstream proxy username (repeatable, pairs with --upstream)
@@ -127,6 +128,12 @@ enum SellerCmd {
         /// Upstream proxy password (repeatable, pairs with --upstream)
         #[arg(long = "upstream-pass")]
         upstream_passes: Vec<String>,
+        /// Path to a file containing upstream proxies (one per line), or '-' for stdin
+        #[arg(long = "upstream-file", short = 'f')]
+        upstream_file: Option<std::path::PathBuf>,
+        /// Fail on any invalid proxy line in upstream file (default: skip with warning)
+        #[arg(long = "upstream-strict")]
+        upstream_strict: bool,
         /// Disable direct (own bandwidth). Only use --upstream proxies.
         #[arg(long)]
         no_direct: bool,
@@ -141,6 +148,26 @@ enum SellerCmd {
     Stop,
     /// Show seller status (daemon + backend stats)
     Status,
+    /// Parse and validate an upstream proxy file without starting the seller
+    ParseUpstreams {
+        /// Path to proxy file or '-' for stdin
+        file: std::path::PathBuf,
+        /// Output formatted report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Test TCP connection and latency to upstream SOCKS5 proxies
+    TestUpstreams {
+        /// Path to proxy file or '-' for stdin
+        #[arg(short = 'f', long = "upstream-file")]
+        file: Option<std::path::PathBuf>,
+        /// Inline upstream proxies (repeatable)
+        #[arg(long = "upstream")]
+        upstream: Vec<String>,
+        /// Connection timeout in seconds
+        #[arg(long, default_value = "5")]
+        timeout: u64,
+    },
     /// Manage payouts
     Payout {
         #[command(subcommand)]
@@ -206,30 +233,25 @@ enum DepositCmd {
 }
 
 /// Upstream SOCKS5 proxy for resell.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct UpstreamProxy {
     address: String,
-    username: String,
-    password: String,
-    /// Parsed from --upstream-user (e.g. "type_residential" → "residential").
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    /// Parsed from --upstream-user (e.g. "type_residential" → "residential") or query parameters.
     country: Option<String>,
     proxy_category: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 /// Parse country and proxy_category from an upstream username.
 /// Format: `user_2930d5,type_residential,country_US,session_usresidential`
 /// Extracts: country="US", proxy_category="residential"
 fn parse_upstream_metadata(username: &str) -> (Option<String>, Option<String>) {
-    let mut country = None;
-    let mut category = None;
-    for part in username.split(',') {
-        if let Some(c) = part.strip_prefix("country_") {
-            country = Some(c.to_uppercase());
-        } else if let Some(net) = part.strip_prefix("type_") {
-            category = Some(net.to_lowercase());
-        }
-    }
-    (country, category)
+    proxy_parser::parse_upstream_metadata(username)
 }
 
 /// Resolve the remote SOCKS5 gateway address from the backend URL.
@@ -273,15 +295,24 @@ struct SellerConfig {
     /// Defaulted so configs written by older CLI versions still load.
     #[serde(default)]
     volunteer: bool,
+    /// Optional path to upstream proxy file (if loaded from file)
+    #[serde(default)]
+    upstream_file: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 struct UpstreamProxyConfig {
     address: String,
-    username: String,
-    password: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
     country: Option<String>,
+    #[serde(default)]
     proxy_category: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 fn seller_config_path() -> std::path::PathBuf {
@@ -936,29 +967,51 @@ async fn run_stream_relay(
         Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     )> = match upstream {
         Some(proxy) => {
-            eprintln!("[RELAY {}] Using upstream proxy {} (user={})", sid, proxy.address, proxy.username);
-            // fast-socks5 has no built-in connect timeout (Config::default()
-            // leaves connect_timeout as None), so a dead/stalling upstream
-            // would hold its socket FD forever. Bound the whole handshake.
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(10),
-                fast_socks5::client::Socks5Stream::connect_with_password(
-                    &proxy.address,
-                    target_dest.to_string(),
-                    target_port,
-                    proxy.username.clone(),
-                    proxy.password.clone(),
-                    fast_socks5::client::Config::default(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => {
-                    let (r, w) = tokio::io::split(stream);
-                    Ok((Box::new(r), Box::new(w)))
+            let has_auth = proxy.username.as_ref().map(|u| !u.is_empty()).unwrap_or(false);
+            if has_auth {
+                let u = proxy.username.clone().unwrap_or_default();
+                let p = proxy.password.clone().unwrap_or_default();
+                eprintln!("[RELAY {}] Using upstream proxy {} (user={})", sid, proxy.address, u);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    fast_socks5::client::Socks5Stream::connect_with_password(
+                        &proxy.address,
+                        target_dest.to_string(),
+                        target_port,
+                        u,
+                        p,
+                        fast_socks5::client::Config::default(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        let (r, w) = tokio::io::split(stream);
+                        Ok((Box::new(r), Box::new(w)))
+                    }
+                    Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
+                    Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
                 }
-                Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
-                Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
+            } else {
+                eprintln!("[RELAY {}] Using upstream proxy {} (unauthenticated)", sid, proxy.address);
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    fast_socks5::client::Socks5Stream::connect(
+                        &proxy.address,
+                        target_dest.to_string(),
+                        target_port,
+                        fast_socks5::client::Config::default(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        let (r, w) = tokio::io::split(stream);
+                        Ok((Box::new(r), Box::new(w)))
+                    }
+                    Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
+                    Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
+                }
             }
         }
         None => {
@@ -1556,8 +1609,144 @@ async fn main() -> Result<()> {
 
         // --- Seller ---
         Commands::Seller { cmd } => {
-            // Daemon-only commands (no auth required)
-            match cmd {
+            // Standalone inspection / diagnostic / daemon commands (no auth required)
+            match &cmd {
+                SellerCmd::ParseUpstreams { file, json } => {
+                    let report = if file == std::path::Path::new("-") {
+                        proxy_parser::parse_proxy_stdin()?
+                    } else {
+                        proxy_parser::parse_proxy_file(file)?
+                    };
+
+                    if *json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                        return Ok(());
+                    }
+
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+                    println!(" Upstream SOCKS5 Proxy Parsing Report");
+                    println!(" Source: {}", file.display());
+                    println!(" Total lines: {} | Parsed: {} | Skipped/Comments: {} | Duplicates: {} | Warnings: {}",
+                        report.total_lines,
+                        report.parsed_count,
+                        report.skipped_empty_or_comments,
+                        report.duplicates_deduplicated,
+                        report.warnings.len(),
+                    );
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+
+                    if !report.proxies.is_empty() {
+                        println!("{:<4} {:<30} {:<18} {:<10} {:<14} {:<15}", "#", "Address", "Auth", "Country", "Category", "Label");
+                        println!("{:-<4} {:-<30} {:-<18} {:-<10} {:-<14} {:-<15}", "", "", "", "", "", "");
+                        for (i, p) in report.proxies.iter().enumerate() {
+                            let auth_str = match (&p.username, &p.password) {
+                                (Some(u), Some(_)) => format!("user: {}", u),
+                                (Some(u), None) => format!("user: {}", u),
+                                _ => "none (open)".to_string(),
+                            };
+                            let auth_display = if auth_str.len() > 17 {
+                                format!("{}…", &auth_str[..16])
+                            } else {
+                                auth_str
+                            };
+                            let country_str = p.country.as_deref().unwrap_or("—");
+                            let cat_str = p.proxy_category.as_deref().unwrap_or("—");
+                            let label_str = p.label.as_deref().unwrap_or("—");
+                            println!("{:<4} {:<30} {:<18} {:<10} {:<14} {:<15}", i + 1, p.address, auth_display, country_str, cat_str, label_str);
+                        }
+                    }
+
+                    if !report.warnings.is_empty() {
+                        println!("\nWarnings ({} line(s) skipped):", report.warnings.len());
+                        for w in &report.warnings {
+                            println!("  [Line {}] {}: {}", w.line_number, w.reason, w.raw_line);
+                        }
+                    }
+                    println!("");
+                    return Ok(());
+                }
+                SellerCmd::TestUpstreams { file, upstream, timeout } => {
+                    let mut parsed_proxies = Vec::new();
+                    if let Some(f) = file {
+                        let report = if f == std::path::Path::new("-") {
+                            proxy_parser::parse_proxy_stdin()?
+                        } else {
+                            proxy_parser::parse_proxy_file(f)?
+                        };
+                        for w in &report.warnings {
+                            eprintln!("Warning: [Line {}] {}: {}", w.line_number, w.reason, w.raw_line);
+                        }
+                        parsed_proxies.extend(report.proxies);
+                    }
+                    for u_str in upstream {
+                        if let Ok(Some(p)) = proxy_parser::parse_proxy_line(u_str) {
+                            parsed_proxies.push(p);
+                        }
+                    }
+
+                    if parsed_proxies.is_empty() {
+                        println!("No proxies provided to test. Specify -f <FILE> or --upstream <PROXY>.");
+                        return Ok(());
+                    }
+
+                    println!("Testing {} upstream SOCKS5 proxy endpoint(s) (timeout: {}s)...", parsed_proxies.len(), timeout);
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+
+                    let timeout_dur = tokio::time::Duration::from_secs(*timeout);
+                    let mut success_count = 0;
+                    let mut fail_count = 0;
+
+                    for (i, p) in parsed_proxies.iter().enumerate() {
+                        let start = std::time::Instant::now();
+                        let res = match (&p.username, &p.password) {
+                            (Some(u), Some(pass)) => {
+                                tokio::time::timeout(
+                                    timeout_dur,
+                                    fast_socks5::client::Socks5Stream::connect_with_password(
+                                        &p.address,
+                                        "1.1.1.1".to_string(),
+                                        80,
+                                        u.clone(),
+                                        pass.clone(),
+                                        fast_socks5::client::Config::default(),
+                                    ),
+                                ).await
+                            }
+                            _ => {
+                                tokio::time::timeout(
+                                    timeout_dur,
+                                    fast_socks5::client::Socks5Stream::connect(
+                                        &p.address,
+                                        "1.1.1.1".to_string(),
+                                        80,
+                                        fast_socks5::client::Config::default(),
+                                    ),
+                                ).await
+                            }
+                        };
+                        let elapsed = start.elapsed();
+
+                        match res {
+                            Ok(Ok(_stream)) => {
+                                success_count += 1;
+                                let country_str = p.country.as_deref().unwrap_or("—");
+                                let cat_str = p.proxy_category.as_deref().unwrap_or("—");
+                                println!("[✓ OK]   #{:<3} {:<28} {:>5}ms (country: {}, type: {})", i + 1, p.address, elapsed.as_millis(), country_str, cat_str);
+                            }
+                            Ok(Err(e)) => {
+                                fail_count += 1;
+                                println!("[✗ FAIL] #{:<3} {:<28} SOCKS5 connect failed: {:?}", i + 1, p.address, e);
+                            }
+                            Err(_) => {
+                                fail_count += 1;
+                                println!("[✗ FAIL] #{:<3} {:<28} Timed out after {}s", i + 1, p.address, timeout);
+                            }
+                        }
+                    }
+                    println!("════════════════════════════════════════════════════════════════════════════════════════");
+                    println!("Test summary: {}/{} passed, {} failed", success_count, parsed_proxies.len(), fail_count);
+                    return Ok(());
+                }
                 SellerCmd::Stop => {
                     let daemon = seller_daemon();
                     // Stop the running daemon
@@ -1588,44 +1777,123 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Not authenticated. Run 'proxybase-cli login' first.");
             }
             match cmd {
-                SellerCmd::Start { upstream_hosts, upstream_users, upstream_passes, no_direct, volunteer, foreground } => {
-                    // Build proxy list from args
-                    let n = upstream_hosts.len().min(upstream_users.len()).min(upstream_passes.len());
-                    let proxies: Vec<UpstreamProxy> = (0..n).map(|i| {
-                        let (country, proxy_category) = parse_upstream_metadata(&upstream_users[i]);
-                        UpstreamProxy {
-                            address: upstream_hosts[i].clone(),
-                            username: upstream_users[i].clone(),
-                            password: upstream_passes[i].clone(),
-                            country,
-                            proxy_category,
+                SellerCmd::Start {
+                    upstream_hosts,
+                    upstream_users,
+                    upstream_passes,
+                    upstream_file,
+                    upstream_strict,
+                    no_direct,
+                    volunteer,
+                    foreground,
+                } => {
+                    let mut collected_proxies: Vec<UpstreamProxy> = Vec::new();
+                    let mut seen_keys = std::collections::HashSet::new();
+
+                    // 1. Load from file if provided
+                    if let Some(ref file_path) = upstream_file {
+                        let report = if file_path == std::path::Path::new("-") {
+                            proxy_parser::parse_proxy_stdin()?
+                        } else {
+                            proxy_parser::parse_proxy_file(file_path)?
+                        };
+
+                        if !report.warnings.is_empty() {
+                            for w in &report.warnings {
+                                eprintln!("Warning: [Line {}] {}: {}", w.line_number, w.reason, w.raw_line);
+                            }
+                            if upstream_strict {
+                                anyhow::bail!(
+                                    "Aborting seller start due to {} invalid proxy line(s) in upstream file (strict mode)",
+                                    report.warnings.len()
+                                );
+                            }
                         }
-                    }).collect();
-                    if upstream_hosts.len() != n || upstream_users.len() != n || upstream_passes.len() != n {
-                        eprintln!("Warning: --upstream, --upstream-user, --upstream-pass counts differ. Using {} proxy(s).", n);
+
+                        for p in report.proxies {
+                            let key = format!("{}|{}", p.address.to_lowercase(), p.username.as_deref().unwrap_or(""));
+                            if seen_keys.insert(key) {
+                                collected_proxies.push(UpstreamProxy {
+                                    address: p.address,
+                                    username: p.username,
+                                    password: p.password,
+                                    country: p.country,
+                                    proxy_category: p.proxy_category,
+                                    label: p.label,
+                                });
+                            }
+                        }
+                        println!(
+                            "Loaded {} upstream proxy(s) from '{}' ({} skipped comments/blank)",
+                            collected_proxies.len(),
+                            file_path.display(),
+                            report.skipped_empty_or_comments
+                        );
                     }
 
-                    // Save config if explicit args provided (so daemon can restart without args).
-                    // Volunteer mode is also persisted so the daemon keeps donating
-                    // bandwidth after restart.
-                    let has_upstream_args = !upstream_hosts.is_empty() || !upstream_users.is_empty() || !upstream_passes.is_empty();
+                    // 2. Parse inline --upstream arguments (connection strings or separate --upstream-user/pass)
+                    for (i, host_arg) in upstream_hosts.iter().enumerate() {
+                        // If it's a full connection string (e.g. socks5://... or host:port:user:pass)
+                        if let Ok(Some(parsed)) = proxy_parser::parse_proxy_line(host_arg) {
+                            if parsed.username.is_some() || parsed.password.is_some() || upstream_users.is_empty() {
+                                let key = format!("{}|{}", parsed.address.to_lowercase(), parsed.username.as_deref().unwrap_or(""));
+                                if seen_keys.insert(key) {
+                                    collected_proxies.push(UpstreamProxy {
+                                        address: parsed.address,
+                                        username: parsed.username,
+                                        password: parsed.password,
+                                        country: parsed.country,
+                                        proxy_category: parsed.proxy_category,
+                                        label: parsed.label,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+
+                        // Otherwise pair with --upstream-user / --upstream-pass if available
+                        let user_opt = upstream_users.get(i).cloned();
+                        let pass_opt = upstream_passes.get(i).cloned();
+                        let (country, proxy_category) = user_opt.as_deref()
+                            .map(parse_upstream_metadata)
+                            .unwrap_or((None, None));
+
+                        let key = format!("{}|{}", host_arg.to_lowercase(), user_opt.as_deref().unwrap_or(""));
+                        if seen_keys.insert(key) {
+                            collected_proxies.push(UpstreamProxy {
+                                address: host_arg.clone(),
+                                username: user_opt,
+                                password: pass_opt,
+                                country,
+                                proxy_category,
+                                label: None,
+                            });
+                        }
+                    }
+
+                    let has_upstream_args = !upstream_hosts.is_empty()
+                        || !upstream_users.is_empty()
+                        || !upstream_passes.is_empty()
+                        || upstream_file.is_some();
                     let has_explicit_args = has_upstream_args || volunteer || no_direct;
 
                     let config = if has_explicit_args {
                         let cfg = SellerConfig {
                             upstream_proxies: if has_upstream_args {
-                                proxies.iter().map(|p| UpstreamProxyConfig {
+                                collected_proxies.iter().map(|p| UpstreamProxyConfig {
                                     address: p.address.clone(),
                                     username: p.username.clone(),
                                     password: p.password.clone(),
                                     country: p.country.clone(),
                                     proxy_category: p.proxy_category.clone(),
+                                    label: p.label.clone(),
                                 }).collect()
                             } else {
                                 load_seller_config_or_default().upstream_proxies
                             },
                             no_direct,
                             volunteer,
+                            upstream_file: upstream_file.as_ref().map(|p| p.to_string_lossy().to_string()),
                         };
                         save_seller_config(&cfg)?;
                         cfg
@@ -1646,6 +1914,7 @@ async fn main() -> Result<()> {
                             password: u.password.clone(),
                             country: u.country.clone(),
                             proxy_category: u.proxy_category.clone(),
+                            label: u.label.clone(),
                         }).collect();
                         let include = !config.no_direct;
                         (p, include, config.volunteer)
@@ -1738,7 +2007,10 @@ async fn main() -> Result<()> {
                         Err(e) => println!("Backend: unreachable ({e})"),
                     }
                 }
-                SellerCmd::Stop | SellerCmd::Install => {
+                SellerCmd::Stop
+                | SellerCmd::Install
+                | SellerCmd::ParseUpstreams { .. }
+                | SellerCmd::TestUpstreams { .. } => {
                     // Handled above (before auth check)
                     unreachable!();
                 }
@@ -2048,10 +2320,11 @@ mod tests {
     fn make_upstream(addr: &str, user: &str, pass: &str) -> UpstreamProxy {
         UpstreamProxy {
             address: addr.to_string(),
-            username: user.to_string(),
-            password: pass.to_string(),
+            username: Some(user.to_string()),
+            password: Some(pass.to_string()),
             country: None,
             proxy_category: None,
+            label: None,
         }
     }
 
@@ -2155,8 +2428,8 @@ mod tests {
         let paths = build_paths(&upstreams, false);
         let p = paths[0].1.as_ref().unwrap();
         assert_eq!(p.address, "portal.anyip.io:1080");
-        assert_eq!(p.username, "user_2930d5,type_residential,country_US");
-        assert_eq!(p.password, "8198c6");
+        assert_eq!(p.username.as_deref(), Some("user_2930d5,type_residential,country_US"));
+        assert_eq!(p.password.as_deref(), Some("8198c6"));
     }
 
     #[test]
