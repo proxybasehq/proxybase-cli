@@ -2116,8 +2116,11 @@ async fn main() -> Result<()> {
                             .iter()
                             .filter(|e| {
                                 let c = e.get("country").and_then(|v| v.as_str()).unwrap_or("");
-                                let t = e.get("proxy_category").and_then(|v| v.as_str()).unwrap_or("");
-                                c == country && t == network_type
+                                let t = e.get("network_type")
+                                    .or_else(|| e.get("proxy_category"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                c.eq_ignore_ascii_case(&country) && t.eq_ignore_ascii_case(&network_type)
                             })
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&filtered)?);
@@ -2133,8 +2136,15 @@ async fn main() -> Result<()> {
                     bridge,
                     bridge_port,
                 } => {
+                    let normalized_country = if country.eq_ignore_ascii_case("worldwide") {
+                        "WorldWide".to_string()
+                    } else if country.eq_ignore_ascii_case("unknown") {
+                        "Unknown".to_string()
+                    } else {
+                        country
+                    };
                     let session = client
-                        .create_session(&country, &network_type, &session_type, None)
+                        .create_session(&normalized_country, &network_type, &session_type, None)
                         .await?;
                     println!("{}", serde_json::to_string_pretty(&session)?);
                     if let Some(sid) = session.get("session_id").and_then(|v| v.as_str()) {
@@ -2929,5 +2939,60 @@ mod tests {
             .expect("relay must not panic");
 
         assert!(relay_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn test_worldwide_and_unknown_price_filtering_and_normalization() {
+        let entries = serde_json::json!([
+            {"country": "WorldWide", "network_type": "residential", "buyer_price_microcredits_per_gb": 2500000},
+            {"country": "Unknown", "network_type": "burner", "buyer_price_microcredits_per_gb": 1000000},
+            {"country": "US", "proxy_category": "residential", "buyer_price_microcredits_per_gb": 3000000}
+        ]);
+
+        let items = entries.as_array().unwrap();
+
+        // 1. Case-insensitive WorldWide query
+        let query_country = "worldwide";
+        let query_type = "RESIDENTIAL";
+        let filtered_ww: Vec<_> = items.iter().filter(|e| {
+            let c = e.get("country").and_then(|v| v.as_str()).unwrap_or("");
+            let t = e.get("network_type")
+                .or_else(|| e.get("proxy_category"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            c.eq_ignore_ascii_case(query_country) && t.eq_ignore_ascii_case(query_type)
+        }).collect();
+        assert_eq!(filtered_ww.len(), 1);
+        assert_eq!(filtered_ww[0]["country"], "WorldWide");
+
+        // 2. Case-insensitive Unknown query
+        let query_u_country = "unknown";
+        let query_u_type = "burner";
+        let filtered_u: Vec<_> = items.iter().filter(|e| {
+            let c = e.get("country").and_then(|v| v.as_str()).unwrap_or("");
+            let t = e.get("network_type")
+                .or_else(|| e.get("proxy_category"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            c.eq_ignore_ascii_case(query_u_country) && t.eq_ignore_ascii_case(query_u_type)
+        }).collect();
+        assert_eq!(filtered_u.len(), 1);
+        assert_eq!(filtered_u[0]["country"], "Unknown");
+
+        // 3. Normalization logic
+        let normalize = |c: &str| -> String {
+            if c.eq_ignore_ascii_case("worldwide") {
+                "WorldWide".to_string()
+            } else if c.eq_ignore_ascii_case("unknown") {
+                "Unknown".to_string()
+            } else {
+                c.to_string()
+            }
+        };
+        assert_eq!(normalize("worldwide"), "WorldWide");
+        assert_eq!(normalize("WORLDWIDE"), "WorldWide");
+        assert_eq!(normalize("unknown"), "Unknown");
+        assert_eq!(normalize("UNKNOWN"), "Unknown");
+        assert_eq!(normalize("US"), "US");
     }
 }
