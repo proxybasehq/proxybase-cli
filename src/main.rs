@@ -529,12 +529,18 @@ async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct
     // Spawn one connection per path — each runs independently with its own reconnect loop.
     // Token is shared via Arc<Mutex<>> so re-auth by one path benefits all.
     let mut handles = Vec::new();
-    for (path_id, upstream) in paths {
+    let num_paths = paths.len();
+    for (idx, (path_id, upstream)) in paths.into_iter().enumerate() {
         let token = token.clone();
         let url = base_url.clone();
         handles.push(tokio::spawn(async move {
             run_single_path_loop(&url, token, &path_id, upstream.as_ref()).await;
         }));
+
+        // Stagger initial connections when running many paths to prevent TCP SYN flood / thundering herd
+        if num_paths > 10 && idx + 1 < num_paths {
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
     }
 
     for h in handles {
@@ -1228,14 +1234,14 @@ async fn run_single_path_loop(
                         backoff_secs = 1;
                     }
                     Err(auth_err) => {
-                        eprintln!("[{}] Re-auth failed: {}. Retrying in {}s...", path_id, auth_err, backoff_secs);
+                        eprintln!("[{}] Re-auth failed: {:#}. Retrying in {}s...", path_id, auth_err, backoff_secs);
                         tokio::time::sleep(jittered_backoff(backoff_secs)).await;
                         backoff_secs = (backoff_secs * 2).min(60);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[{}] Connection failed: {}. Retrying in {}s...", path_id, e, backoff_secs);
+                eprintln!("[{}] Connection failed: {:#}. Retrying in {}s...", path_id, e, backoff_secs);
                 tokio::time::sleep(jittered_backoff(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(60);
             }
@@ -1458,12 +1464,36 @@ async fn authenticate(client: &BackendClient, wm: &libproxybase::WalletManager) 
     Ok(auth.session_token)
 }
 
+#[cfg(unix)]
+fn raise_fd_limit() {
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+            let target = if rlim.rlim_max > 0 {
+                rlim.rlim_max.min(65535).max(rlim.rlim_cur)
+            } else {
+                65535
+            };
+            if target > rlim.rlim_cur {
+                rlim.rlim_cur = target;
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(unix)]
+    raise_fd_limit();
+
     update::cleanup_stale();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
