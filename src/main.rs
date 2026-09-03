@@ -2101,7 +2101,15 @@ async fn main() -> Result<()> {
             }
             match cmd {
                 MarketCmd::Countries => {
-                    let countries = client.list_countries().await?;
+                    let mut countries = client.list_countries().await?;
+                    if let Some(arr) = countries.get_mut("countries").and_then(|v| v.as_array_mut()) {
+                        for item in arr.iter_mut() {
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.remove("seller_count");
+                                obj.remove("available_sellers");
+                            }
+                        }
+                    }
                     println!("{}", serde_json::to_string_pretty(&countries)?);
                 }
                 MarketCmd::Currencies => {
@@ -2109,9 +2117,15 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&currencies)?);
                 }
                 MarketCmd::Prices { country, network_type } => {
-                    let pricing = client.list_pricing().await?;
-                    // Filter by country/type if provided
-                    if let Some(entries) = pricing.get("pricing").and_then(|p| p.as_array()) {
+                    let mut pricing = client.list_pricing().await?;
+                    // Filter by country/type if provided and omit online count
+                    if let Some(entries) = pricing.get_mut("pricing").and_then(|p| p.as_array_mut()) {
+                        for e in entries.iter_mut() {
+                            if let Some(obj) = e.as_object_mut() {
+                                obj.remove("available_sellers");
+                                obj.remove("seller_count");
+                            }
+                        }
                         let filtered: Vec<_> = entries
                             .iter()
                             .filter(|e| {
@@ -2122,9 +2136,18 @@ async fn main() -> Result<()> {
                                     .unwrap_or("");
                                 c.eq_ignore_ascii_case(&country) && t.eq_ignore_ascii_case(&network_type)
                             })
+                            .cloned()
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&filtered)?);
                     } else {
+                        if let Some(entries) = pricing.get_mut("pricing").and_then(|p| p.as_array_mut()) {
+                            for e in entries.iter_mut() {
+                                if let Some(obj) = e.as_object_mut() {
+                                    obj.remove("available_sellers");
+                                    obj.remove("seller_count");
+                                }
+                            }
+                        }
                         println!("{}", serde_json::to_string_pretty(&pricing)?);
                     }
                 }
