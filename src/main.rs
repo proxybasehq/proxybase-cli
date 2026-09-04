@@ -2103,10 +2103,27 @@ async fn main() -> Result<()> {
                 MarketCmd::Countries => {
                     let mut countries = client.list_countries().await?;
                     if let Some(arr) = countries.get_mut("countries").and_then(|v| v.as_array_mut()) {
+                        arr.retain(|item| {
+                            let c = item.get("country").and_then(|v| v.as_str()).unwrap_or("");
+                            !c.trim().is_empty()
+                        });
                         for item in arr.iter_mut() {
                             if let Some(obj) = item.as_object_mut() {
                                 obj.remove("seller_count");
                                 obj.remove("available_sellers");
+                                let c_str = obj.get("country").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let code = libproxybase::market::countries::country_code(&c_str);
+                                let name = libproxybase::market::countries::country_name(&c_str);
+                                let flag = libproxybase::market::countries::country_flag(&c_str);
+                                if !obj.contains_key("country_code") {
+                                    obj.insert("country_code".to_string(), serde_json::Value::String(code));
+                                }
+                                if !obj.contains_key("country_name") {
+                                    obj.insert("country_name".to_string(), serde_json::Value::String(name));
+                                }
+                                if !obj.contains_key("flag_emoji") {
+                                    obj.insert("flag_emoji".to_string(), serde_json::Value::String(flag));
+                                }
                             }
                         }
                     }
@@ -2118,33 +2135,75 @@ async fn main() -> Result<()> {
                 }
                 MarketCmd::Prices { country, network_type } => {
                     let mut pricing = client.list_pricing().await?;
+                    let norm_country = libproxybase::market::countries::country_code(&country);
+                    let norm_name = libproxybase::market::countries::country_name(&country);
                     // Filter by country/type if provided and omit online count
                     if let Some(entries) = pricing.get_mut("pricing").and_then(|p| p.as_array_mut()) {
+                        entries.retain(|e| {
+                            let c = e.get("country").and_then(|v| v.as_str()).unwrap_or("");
+                            !c.trim().is_empty()
+                        });
                         for e in entries.iter_mut() {
                             if let Some(obj) = e.as_object_mut() {
                                 obj.remove("available_sellers");
                                 obj.remove("seller_count");
+                                let c_str = obj.get("country").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let code = libproxybase::market::countries::country_code(&c_str);
+                                let name = libproxybase::market::countries::country_name(&c_str);
+                                let flag = libproxybase::market::countries::country_flag(&c_str);
+                                if !obj.contains_key("country_code") {
+                                    obj.insert("country_code".to_string(), serde_json::Value::String(code));
+                                }
+                                if !obj.contains_key("country_name") {
+                                    obj.insert("country_name".to_string(), serde_json::Value::String(name));
+                                }
+                                if !obj.contains_key("flag_emoji") {
+                                    obj.insert("flag_emoji".to_string(), serde_json::Value::String(flag));
+                                }
                             }
                         }
                         let filtered: Vec<_> = entries
                             .iter()
                             .filter(|e| {
                                 let c = e.get("country").and_then(|v| v.as_str()).unwrap_or("");
+                                let c_code = e.get("country_code").and_then(|v| v.as_str()).unwrap_or(c);
+                                let c_name = e.get("country_name").and_then(|v| v.as_str()).unwrap_or("");
                                 let t = e.get("network_type")
                                     .or_else(|| e.get("proxy_category"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                c.eq_ignore_ascii_case(&country) && t.eq_ignore_ascii_case(&network_type)
+                                (c.eq_ignore_ascii_case(&country)
+                                    || c_code.eq_ignore_ascii_case(&norm_country)
+                                    || c.eq_ignore_ascii_case(&norm_country)
+                                    || (!c_name.is_empty() && c_name.eq_ignore_ascii_case(&norm_name)))
+                                    && t.eq_ignore_ascii_case(&network_type)
                             })
                             .cloned()
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&filtered)?);
                     } else {
                         if let Some(entries) = pricing.get_mut("pricing").and_then(|p| p.as_array_mut()) {
+                            entries.retain(|e| {
+                                let c = e.get("country").and_then(|v| v.as_str()).unwrap_or("");
+                                !c.trim().is_empty()
+                            });
                             for e in entries.iter_mut() {
                                 if let Some(obj) = e.as_object_mut() {
                                     obj.remove("available_sellers");
                                     obj.remove("seller_count");
+                                    let c_str = obj.get("country").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let code = libproxybase::market::countries::country_code(&c_str);
+                                    let name = libproxybase::market::countries::country_name(&c_str);
+                                    let flag = libproxybase::market::countries::country_flag(&c_str);
+                                    if !obj.contains_key("country_code") {
+                                        obj.insert("country_code".to_string(), serde_json::Value::String(code));
+                                    }
+                                    if !obj.contains_key("country_name") {
+                                        obj.insert("country_name".to_string(), serde_json::Value::String(name));
+                                    }
+                                    if !obj.contains_key("flag_emoji") {
+                                        obj.insert("flag_emoji".to_string(), serde_json::Value::String(flag));
+                                    }
                                 }
                             }
                         }
@@ -2159,13 +2218,7 @@ async fn main() -> Result<()> {
                     bridge,
                     bridge_port,
                 } => {
-                    let normalized_country = if country.eq_ignore_ascii_case("worldwide") {
-                        "WorldWide".to_string()
-                    } else if country.eq_ignore_ascii_case("unknown") {
-                        "Unknown".to_string()
-                    } else {
-                        country
-                    };
+                    let normalized_country = libproxybase::market::countries::normalize_country(&country);
                     let session = client
                         .create_session(&normalized_country, &network_type, &session_type, None)
                         .await?;
@@ -2173,7 +2226,9 @@ async fn main() -> Result<()> {
                     if let Some(sid) = session.get("session_id").and_then(|v| v.as_str()) {
                         let token = client.token.as_deref().unwrap_or("");
                         let proxy_addr = socks5_proxy_address(&cli.backend);
-                        println!("Session {} opened.", sid);
+                        let flag = libproxybase::market::countries::country_flag(&normalized_country);
+                        let full_name = libproxybase::market::countries::country_name(&normalized_country);
+                        println!("Session {} opened for {} {} ({}/{}).", sid, flag, full_name, normalized_country, network_type);
                         println!("");
                         print_session_credentials(sid, token, &proxy_addr, &cli.backend);
                         if bridge {
@@ -2210,7 +2265,8 @@ async fn main() -> Result<()> {
                             let country = s.get("country").and_then(|v| v.as_str()).unwrap_or("?");
                             let network = s.get("network_type").and_then(|v| v.as_str()).unwrap_or("?");
                             let stype = s.get("session_type").and_then(|v| v.as_str()).unwrap_or("?");
-                            println!("  {}  {} {} {}  →  {} (user {} / pass {})", sid, country, network, stype, proxy_addr, sid, token);
+                            let flag = libproxybase::market::countries::country_flag(country);
+                            println!("  {}  {} {} {} {}  →  {} (user {} / pass {})", sid, flag, country, network, stype, proxy_addr, sid, token);
                         }
                         if let Some(sid) = entries.first().and_then(|s| s.get("session_id")).and_then(|v| v.as_str()) {
                             println!("\nExample:");

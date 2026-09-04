@@ -1,6 +1,6 @@
 [package]
 name = "proxybase-cli"
-version = "0.1.40"
+version = "0.1.41"
 edition = "2021"
 description = "Official ProxyBase command-line client"
 license = "MIT"
