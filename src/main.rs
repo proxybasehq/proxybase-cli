@@ -496,7 +496,7 @@ fn seller_daemon() -> daemon_kit::Daemon {
 
 /// Build the list of paths: direct (None) + each upstream proxy.
 fn build_paths(upstreams: &[UpstreamProxy], include_direct: bool) -> Vec<(String, Option<UpstreamProxy>)> {
-    let mut paths: Vec<(String, Option<UpstreamProxy>)> = Vec::new();
+    let mut paths: Vec<(String, Option<UpstreamProxy>)> = Vec::with_capacity(upstreams.len() + 1);
     if include_direct {
         paths.push(("direct".to_string(), None));
     }
@@ -531,7 +531,12 @@ async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct
     ));
     let base_url = backend_url.to_string();
 
-    eprintln!("[seller] Starting {} path(s): {:?}", paths.len(), paths.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
+    if paths.len() <= 10 {
+        eprintln!("[seller] Starting {} path(s): {:?}", paths.len(), paths.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
+    } else {
+        let sample: Vec<&str> = paths.iter().take(5).map(|(id, _)| id.as_str()).collect();
+        eprintln!("[seller] Starting {} path(s) (preview: {:?}, ...)", paths.len(), sample);
+    }
 
     if no_multiplex || paths.len() <= 1 {
         // Spawn one connection per path — each runs independently with its own reconnect loop.
@@ -1332,7 +1337,6 @@ async fn try_single_path_connection(
         tokio::time::Instant::now() + Duration::from_secs(90),
         Duration::from_secs(90),
     );
-    const MAX_STREAMS: usize = 100;
 
     loop {
         tokio::select! {
@@ -1377,7 +1381,6 @@ async fn try_single_path_connection(
                                     active.lock().await.remove(sid);
                                 }
                                 Some("stream_open") => {
-                                    if active.lock().await.len() >= MAX_STREAMS { continue; }
                                     let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
                                     let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
                                     let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
@@ -1481,9 +1484,9 @@ async fn run_multiplexed_tunnel_loop(
                     }
                 }
             }
-            Err(e) if e.to_string().contains("MULTIPLEX_UNSUPPORTED") => {
+            Err(e) if e.to_string().contains("MULTIPLEX_UNSUPPORTED") && path_map.len() <= 1 => {
                 eprintln!(
-                    "[{}] Backend does not support multiplexing. Falling back to separate single-path connections...",
+                    "[{}] Backend does not support multiplexing. Falling back to single-path connection...",
                     tunnel_id
                 );
                 let mut fallback_handles = Vec::new();
@@ -1556,9 +1559,9 @@ async fn try_multiplexed_tunnel_connection(
         .await
         .context("Failed to send register_multiplex")?;
 
-    // Wait up to 3 seconds for register_multiplex_ack
+    // Wait up to 15 seconds for register_multiplex_ack
     let mut ack_received = false;
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws_stream.next()).await {
             Ok(Some(Ok(Message::Text(txt)))) => {
@@ -1580,7 +1583,7 @@ async fn try_multiplexed_tunnel_connection(
     }
 
     if !ack_received {
-        anyhow::bail!("MULTIPLEX_UNSUPPORTED");
+        anyhow::bail!("MULTIPLEX_ACK_TIMEOUT");
     }
 
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -1603,7 +1606,6 @@ async fn try_multiplexed_tunnel_connection(
         tokio::time::Instant::now() + Duration::from_secs(90),
         Duration::from_secs(90),
     );
-    const MAX_STREAMS: usize = 2000;
 
     loop {
         tokio::select! {
@@ -1651,7 +1653,6 @@ async fn try_multiplexed_tunnel_connection(
                                     active.lock().await.remove(sid);
                                 }
                                 Some("stream_open") => {
-                                    if active.lock().await.len() >= MAX_STREAMS { continue; }
                                     let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
                                     let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
                                     let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
