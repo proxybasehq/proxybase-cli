@@ -143,6 +143,9 @@ enum SellerCmd {
         /// Run in foreground (don't daemonize). Used internally by the service manager.
         #[arg(long)]
         foreground: bool,
+        /// Disable path multiplexing (legacy mode: one TCP connection per path).
+        #[arg(long)]
+        no_multiplex: bool,
     },
     /// Stop the background seller daemon
     Stop,
@@ -295,6 +298,9 @@ struct SellerConfig {
     /// Defaulted so configs written by older CLI versions still load.
     #[serde(default)]
     volunteer: bool,
+    /// Disable path multiplexing (legacy mode: one TCP connection per path).
+    #[serde(default)]
+    no_multiplex: bool,
     /// Optional path to upstream proxy file (if loaded from file)
     #[serde(default)]
     upstream_file: Option<String>,
@@ -504,9 +510,10 @@ fn build_paths(upstreams: &[UpstreamProxy], include_direct: bool) -> Vec<(String
     paths
 }
 
-/// Shared async seller entry point. Opens one WebSocket connection per path
-/// (direct + each upstream) so each path is independently classified and matched.
-async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct: bool, volunteer: bool) {
+/// Shared async seller entry point. In multiplexed mode (default for >1 path),
+/// multiplexes thousands of virtual paths over up to 16 persistent WebSocket tunnels.
+/// With --no-multiplex or single path, opens one WebSocket connection per path.
+async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct: bool, volunteer: bool, no_multiplex: bool) {
     let client = BackendClient::new(backend_url);
     if !client.is_authenticated() {
         eprintln!("[seller] Not authenticated. Run 'proxybase-cli login' first.");
@@ -526,25 +533,47 @@ async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct
 
     eprintln!("[seller] Starting {} path(s): {:?}", paths.len(), paths.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
 
-    // Spawn one connection per path — each runs independently with its own reconnect loop.
-    // Token is shared via Arc<Mutex<>> so re-auth by one path benefits all.
-    let mut handles = Vec::new();
-    let num_paths = paths.len();
-    for (idx, (path_id, upstream)) in paths.into_iter().enumerate() {
-        let token = token.clone();
-        let url = base_url.clone();
-        handles.push(tokio::spawn(async move {
-            run_single_path_loop(&url, token, &path_id, upstream.as_ref()).await;
-        }));
+    if no_multiplex || paths.len() <= 1 {
+        // Spawn one connection per path — each runs independently with its own reconnect loop.
+        // Token is shared via Arc<Mutex<>> so re-auth by one path benefits all.
+        let mut handles = Vec::new();
+        let num_paths = paths.len();
+        for (idx, (path_id, upstream)) in paths.into_iter().enumerate() {
+            let token = token.clone();
+            let url = base_url.clone();
+            handles.push(tokio::spawn(async move {
+                run_single_path_loop(&url, token, &path_id, upstream.as_ref()).await;
+            }));
 
-        // Stagger initial connections when running many paths to prevent TCP SYN flood / thundering herd
-        if num_paths > 10 && idx + 1 < num_paths {
-            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            // Stagger initial connections when running many paths to prevent TCP SYN flood / thundering herd
+            if num_paths > 10 && idx + 1 < num_paths {
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
         }
-    }
 
-    for h in handles {
-        let _ = h.await;
+        for h in handles {
+            let _ = h.await;
+        }
+    } else {
+        // Phase 2 Multiplexed mode: shard paths across up to 16 tunnels
+        let shards = libproxybase::network::seller_protocol::shard_paths(&paths, 16);
+        eprintln!("[seller] Multiplexing {} paths across {} persistent tunnels", paths.len(), shards.len());
+
+        let mut handles = Vec::new();
+        for (idx, shard) in shards.into_iter().enumerate() {
+            let tunnel_id = format!("tunnel_{}", idx);
+            let token = token.clone();
+            let url = base_url.clone();
+            handles.push(tokio::spawn(async move {
+                run_multiplexed_tunnel_loop(&url, token, &tunnel_id, shard).await;
+            }));
+            // Stagger tunnel connections slightly
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
     }
 }
 
@@ -1391,6 +1420,290 @@ async fn try_single_path_connection(
     Ok(())
 }
 
+/// Multiplexed WebSocket connection loop. Manages one persistent tunnel carrying
+/// multiple virtual paths. Reconnects with exponential backoff.
+/// Falls back to single-path connections if the backend does not ACK multiplexing.
+async fn run_multiplexed_tunnel_loop(
+    backend_url: &str,
+    token: std::sync::Arc<tokio::sync::Mutex<String>>,
+    tunnel_id: &str,
+    paths: Vec<(String, Option<UpstreamProxy>)>,
+) {
+    let path_map: std::sync::Arc<std::collections::HashMap<String, Option<UpstreamProxy>>> =
+        std::sync::Arc::new(paths.into_iter().collect());
+    let path_ids: Vec<String> = path_map.keys().cloned().collect();
+    let mut backoff_secs = 1u64;
+
+    loop {
+        let current_token = token.lock().await.clone();
+        let encoded_token: String =
+            url::form_urlencoded::byte_serialize(current_token.as_bytes()).collect();
+        let ws_url = format!(
+            "{}/v2/ws/seller?token={}",
+            backend_url.replace("https://", "wss://").replace("http://", "ws://"),
+            encoded_token
+        );
+
+        eprintln!(
+            "[{}] Connecting multiplexed tunnel ({} paths, backoff={}s)...",
+            tunnel_id,
+            path_ids.len(),
+            backoff_secs
+        );
+        match try_multiplexed_tunnel_connection(
+            &ws_url,
+            &current_token,
+            tunnel_id,
+            &path_ids,
+            path_map.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                backoff_secs = 1;
+                eprintln!("[{}] Multiplexed tunnel disconnected. Reconnecting...", tunnel_id);
+            }
+            Err(e) if e.to_string().contains("AUTH_EXPIRED") || e.to_string().contains("401") => {
+                eprintln!("[{}] Session token expired. Re-authenticating...", tunnel_id);
+                match re_authenticate_single(backend_url).await {
+                    Ok(new_token) => {
+                        *token.lock().await = new_token;
+                        eprintln!("[{}] Re-authenticated successfully.", tunnel_id);
+                        backoff_secs = 1;
+                    }
+                    Err(auth_err) => {
+                        eprintln!(
+                            "[{}] Re-auth failed: {:#}. Retrying in {}s...",
+                            tunnel_id, auth_err, backoff_secs
+                        );
+                        tokio::time::sleep(jittered_backoff(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(60);
+                    }
+                }
+            }
+            Err(e) if e.to_string().contains("MULTIPLEX_UNSUPPORTED") => {
+                eprintln!(
+                    "[{}] Backend does not support multiplexing. Falling back to separate single-path connections...",
+                    tunnel_id
+                );
+                let mut fallback_handles = Vec::new();
+                for (path_id, upstream) in path_map.iter() {
+                    let u = upstream.clone();
+                    let p = path_id.clone();
+                    let t = token.clone();
+                    let b = backend_url.to_string();
+                    fallback_handles.push(tokio::spawn(async move {
+                        run_single_path_loop(&b, t, &p, u.as_ref()).await;
+                    }));
+                }
+                for h in fallback_handles {
+                    let _ = h.await;
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{}] Tunnel connection failed: {:#}. Retrying in {}s...",
+                    tunnel_id, e, backoff_secs
+                );
+                tokio::time::sleep(jittered_backoff(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
+            }
+        }
+    }
+}
+
+/// Establish one multiplexed WebSocket connection for a batch of paths and relay until disconnect.
+async fn try_multiplexed_tunnel_connection(
+    ws_url: &str,
+    token: &str,
+    tunnel_id: &str,
+    path_ids: &[String],
+    path_map: std::sync::Arc<std::collections::HashMap<String, Option<UpstreamProxy>>>,
+) -> Result<()> {
+    let (ws, _resp) = tokio::time::timeout(
+        tokio::time::Duration::from_secs(15),
+        connect_async(ws_url),
+    )
+    .await
+    .context("connect_async timed out after 15s")?
+    .context("Failed to connect WebSocket")?;
+
+    let conn_id = uuid::Uuid::new_v4().to_string();
+    eprintln!(
+        "[{}] Multiplexed tunnel connected (conn={}, paths={}).",
+        tunnel_id,
+        &conn_id[..8],
+        path_ids.len()
+    );
+
+    let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // Send auth token as first message
+    ws_sink
+        .send(Message::Text(token.to_string()))
+        .await
+        .context("Failed to send auth token")?;
+
+    // Send register_multiplex message with list of path_ids
+    let reg_msg = serde_json::json!({
+        "type": "register_multiplex",
+        "tunnel_id": tunnel_id,
+        "paths": path_ids,
+    });
+    ws_sink
+        .send(Message::Text(serde_json::to_string(&reg_msg).unwrap_or_default()))
+        .await
+        .context("Failed to send register_multiplex")?;
+
+    // Wait up to 3 seconds for register_multiplex_ack
+    let mut ack_received = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws_stream.next()).await {
+            Ok(Some(Ok(Message::Text(txt)))) => {
+                if let Ok(p) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if p.get("type").and_then(|v| v.as_str()) == Some("register_multiplex_ack") {
+                        ack_received = true;
+                        break;
+                    } else if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
+                        anyhow::bail!("AUTH_EXPIRED");
+                    }
+                }
+            }
+            Ok(Some(Ok(Message::Ping(data)))) => {
+                let _ = ws_sink.send(Message::Pong(data)).await;
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+
+    if !ack_received {
+        anyhow::bail!("MULTIPLEX_UNSUPPORTED");
+    }
+
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let active: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    > = Default::default();
+
+    let relay_drain = tokio::spawn(async move {
+        while let Some(msg) = relay_rx.recv().await {
+            if ws_sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut relay_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut ping_tick = interval(Duration::from_secs(30));
+    let mut heartbeat_tick = interval(Duration::from_secs(15));
+    let mut watchdog = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(90),
+        Duration::from_secs(90),
+    );
+    const MAX_STREAMS: usize = 2000;
+
+    loop {
+        tokio::select! {
+            _ = watchdog.tick() => {
+                relay_drain.abort();
+                for h in &relay_tasks { h.abort(); }
+                return Err(anyhow::anyhow!("Connection watchdog: no message in 90s"));
+            }
+            _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
+            _ = heartbeat_tick.tick() => {
+                let current_streams = active.lock().await.len() as u32;
+                let hb = serde_json::json!({
+                    "type": "multiplex_heartbeat",
+                    "tunnel_id": tunnel_id,
+                    "active_streams": current_streams,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "conn_id": conn_id,
+                });
+                let _ = relay_tx.send(Message::Text(serde_json::to_string(&hb).unwrap_or_default()));
+            }
+            msg = ws_stream.next() => {
+                watchdog.reset();
+                match msg {
+                    Some(Ok(Message::Ping(d))) => { let _ = relay_tx.send(Message::Pong(d)); }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
+                                relay_drain.abort();
+                                for h in &relay_tasks { h.abort(); }
+                                return Err(anyhow::anyhow!("AUTH_EXPIRED"));
+                            }
+                            match p.get("type").and_then(|v| v.as_str()) {
+                                Some("relay_data") => {
+                                    if let Some(enc) = p.get("data").and_then(|v| v.as_str()) {
+                                        if let Some(dec) = base64_decode(enc) {
+                                            let streams = active.lock().await;
+                                            let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                                            if let Some(s) = streams.get(sid) { let _ = s.send(dec); }
+                                        }
+                                    }
+                                }
+                                Some("stream_close") => {
+                                    let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    active.lock().await.remove(sid);
+                                }
+                                Some("stream_open") => {
+                                    if active.lock().await.len() >= MAX_STREAMS { continue; }
+                                    let sid = p.get("session_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                                    let tip = p.get("target_ip").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
+                                    let tport = p.get("target_port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
+                                    let thost = p.get("target_host").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    let path_id = p.get("path_id").and_then(|v| v.as_str()).unwrap_or("direct");
+                                    let dest = thost.unwrap_or_else(|| tip.clone());
+                                    eprintln!(
+                                        "[{}/{}] STREAM {} → {}:{} (direct_ip={})",
+                                        tunnel_id, path_id, sid, dest, tport, tip
+                                    );
+
+                                    // ACK the command
+                                    if let Some(seq) = p.get("seq").and_then(|v| v.as_u64()) {
+                                        let ack = serde_json::json!({"type": "cmd_ack", "seq": seq});
+                                        let _ = relay_tx.send(Message::Text(serde_json::to_string(&ack).unwrap_or_default()));
+                                    }
+
+                                    let upstream_opt = path_map.get(path_id).cloned().flatten();
+                                    let streams = active.clone();
+                                    let tx = relay_tx.clone();
+
+                                    let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                                    streams.lock().await.insert(sid.clone(), tcp_tx);
+
+                                    let handle = tokio::spawn(async move {
+                                        run_stream_relay(&dest, &tip, tport, upstream_opt.as_ref(), &tx, tcp_rx, &sid).await;
+                                        streams.lock().await.remove(&sid);
+                                    });
+                                    relay_tasks.push(handle);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        eprintln!("[{}] Backend closed multiplexed tunnel", tunnel_id);
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("[{}] Multiplexed tunnel WS error: {}", tunnel_id, e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    relay_drain.abort();
+    for h in &relay_tasks { h.abort(); }
+    Ok(())
+}
+
 /// Shared client state directory. PROXYBASE_DIR (containers, isolated scratch
 /// runs) wins over the default ~/.proxybase.
 fn data_dir() -> std::path::PathBuf {
@@ -1821,6 +2134,7 @@ async fn main() -> Result<()> {
                     no_direct,
                     volunteer,
                     foreground,
+                    no_multiplex,
                 } => {
                     let mut collected_proxies: Vec<UpstreamProxy> = Vec::new();
                     let mut seen_keys = std::collections::HashSet::new();
@@ -1910,7 +2224,7 @@ async fn main() -> Result<()> {
                         || !upstream_users.is_empty()
                         || !upstream_passes.is_empty()
                         || upstream_file.is_some();
-                    let has_explicit_args = has_upstream_args || volunteer || no_direct;
+                    let has_explicit_args = has_upstream_args || volunteer || no_direct || no_multiplex;
 
                     let config = if has_explicit_args {
                         let cfg = SellerConfig {
@@ -1928,6 +2242,7 @@ async fn main() -> Result<()> {
                             },
                             no_direct,
                             volunteer,
+                            no_multiplex,
                             upstream_file: upstream_file.as_ref().map(|p| p.to_string_lossy().to_string()),
                         };
                         save_seller_config(&cfg)?;
@@ -1974,7 +2289,7 @@ async fn main() -> Result<()> {
                         let _ = std::fs::write(&pid_path, std::process::id().to_string());
 
                         // Already inside a tokio runtime — run directly.
-                        run_seller(&cli.backend, &proxies, include_direct, volunteer_mode).await;
+                        run_seller(&cli.backend, &proxies, include_direct, volunteer_mode, config.no_multiplex).await;
                     } else {
                         let daemon = seller_daemon();
 
@@ -2004,8 +2319,11 @@ async fn main() -> Result<()> {
                            .arg("start")
                            .arg("--foreground")
                            .arg("--backend")
-                           .arg(&cli.backend)
-                           .stdin(std::process::Stdio::null())
+                           .arg(&cli.backend);
+                        if config.no_multiplex {
+                            cmd.arg("--no-multiplex");
+                        }
+                        cmd.stdin(std::process::Stdio::null())
                            .stdout(log_file.try_clone()?)
                            .stderr(log_file);
                         let child = cmd.spawn()
@@ -3078,5 +3396,35 @@ mod tests {
         assert_eq!(normalize("unknown"), "Unknown");
         assert_eq!(normalize("UNKNOWN"), "Unknown");
         assert_eq!(normalize("US"), "US");
+    }
+
+    #[test]
+    fn test_seller_config_no_multiplex_defaults_false() {
+        let json = r#"{"upstream_proxies":[],"no_direct":false}"#;
+        let cfg: SellerConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.no_multiplex, "no_multiplex should default to false for legacy configs");
+
+        let json_with_mux = r#"{"upstream_proxies":[],"no_direct":false,"no_multiplex":true}"#;
+        let cfg2: SellerConfig = serde_json::from_str(json_with_mux).unwrap();
+        assert!(cfg2.no_multiplex, "no_multiplex should deserialize true when present");
+    }
+
+    #[test]
+    fn test_seller_start_no_multiplex_flag_parsing() {
+        let cli = Cli::try_parse_from(["proxybase-cli", "seller", "start", "--no-multiplex"]).unwrap();
+        match cli.command {
+            Commands::Seller { cmd: SellerCmd::Start { no_multiplex, .. } } => {
+                assert!(no_multiplex, "--no-multiplex flag should parse to true");
+            }
+            _ => panic!("expected SellerCmd::Start"),
+        }
+
+        let cli_default = Cli::try_parse_from(["proxybase-cli", "seller", "start"]).unwrap();
+        match cli_default.command {
+            Commands::Seller { cmd: SellerCmd::Start { no_multiplex, .. } } => {
+                assert!(!no_multiplex, "default no_multiplex should be false");
+            }
+            _ => panic!("expected SellerCmd::Start"),
+        }
     }
 }
