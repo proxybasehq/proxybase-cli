@@ -1472,14 +1472,19 @@ fn raise_fd_limit() {
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-            let target = if rlim.rlim_max > 0 {
-                rlim.rlim_max.min(65535).max(rlim.rlim_cur)
+            const TARGET_FD: libc::rlim_t = 1_048_576;
+            let target = if rlim.rlim_max > 0 && rlim.rlim_max != libc::RLIM_INFINITY {
+                rlim.rlim_max.min(TARGET_FD).max(rlim.rlim_cur)
             } else {
-                65535
+                TARGET_FD
             };
             if target > rlim.rlim_cur {
                 rlim.rlim_cur = target;
-                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) != 0 {
+                    // Fallback to hard limit or 65535 if target exceeds kernel/OS ceiling
+                    rlim.rlim_cur = rlim.rlim_max.min(65535).max(1024);
+                    let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+                }
             }
         }
     }
