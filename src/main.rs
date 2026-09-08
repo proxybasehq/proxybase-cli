@@ -990,6 +990,50 @@ struct VerifyResponse {
 // Wallet helper
 // ---------------------------------------------------------------------------
 
+static UPSTREAM_DNS_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, (std::net::IpAddr, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Resolve an upstream proxy address (host:port) to a SocketAddr asynchronously,
+/// caching hostnames (e.g. "pb.zwww.eu.org") in memory so 50k proxies do not trigger
+/// blocking synchronous getaddrinfo calls on Tokio worker threads.
+async fn resolve_upstream_socket_addr(address: &str) -> Option<std::net::SocketAddr> {
+    if let Ok(sa) = address.parse::<std::net::SocketAddr>() {
+        return Some(sa);
+    }
+    let (host, port_str) = address.rsplit_once(':')?;
+    let port: u16 = port_str.parse().ok()?;
+
+    let now = std::time::Instant::now();
+    if let Ok(cache) = UPSTREAM_DNS_CACHE.read() {
+        if let Some((ip, expiry)) = cache.get(host) {
+            if now < *expiry {
+                return Some(std::net::SocketAddr::new(*ip, port));
+            }
+        }
+    }
+
+    if let Ok(mut iter) = tokio::net::lookup_host((host, port)).await {
+        if let Some(sa) = iter.next() {
+            if let Ok(mut cache) = UPSTREAM_DNS_CACHE.write() {
+                cache.insert(
+                    host.to_string(),
+                    (sa.ip(), now + std::time::Duration::from_secs(300)),
+                );
+            }
+            return Some(sa);
+        }
+    }
+
+    if let Ok(cache) = UPSTREAM_DNS_CACHE.read() {
+        if let Some((ip, _)) = cache.get(host) {
+            return Some(std::net::SocketAddr::new(*ip, port));
+        }
+    }
+
+    None
+}
+
 /// Run a bidirectional relay for one stream. Handles both direct TCP and upstream SOCKS5.
 async fn run_stream_relay(
     target_dest: &str, // Domain or IP for SOCKS5 routing
@@ -1008,49 +1052,120 @@ async fn run_stream_relay(
     )> = match upstream {
         Some(proxy) => {
             let has_auth = proxy.username.as_ref().map(|u| !u.is_empty()).unwrap_or(false);
+            let resolved_sa = resolve_upstream_socket_addr(&proxy.address).await;
             if has_auth {
                 let u = proxy.username.clone().unwrap_or_default();
                 let p = proxy.password.clone().unwrap_or_default();
                 eprintln!("[RELAY {}] Using upstream proxy {} (user={})", sid, proxy.address, u);
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(10),
-                    fast_socks5::client::Socks5Stream::connect_with_password(
-                        &proxy.address,
-                        target_dest.to_string(),
-                        target_port,
-                        u,
-                        p,
-                        fast_socks5::client::Config::default(),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => {
+                let mut last_err = anyhow::anyhow!("SOCKS5 connect failed");
+                let mut success_stream = None;
+                for attempt in 0..2 {
+                    if attempt > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    }
+                    let res = match resolved_sa {
+                        Some(sa) => {
+                            tokio::time::timeout(
+                                tokio::time::Duration::from_secs(8),
+                                fast_socks5::client::Socks5Stream::connect_with_password(
+                                    sa,
+                                    target_dest.to_string(),
+                                    target_port,
+                                    u.clone(),
+                                    p.clone(),
+                                    fast_socks5::client::Config::default(),
+                                ),
+                            )
+                            .await
+                        }
+                        None => {
+                            tokio::time::timeout(
+                                tokio::time::Duration::from_secs(8),
+                                fast_socks5::client::Socks5Stream::connect_with_password(
+                                    &proxy.address,
+                                    target_dest.to_string(),
+                                    target_port,
+                                    u.clone(),
+                                    p.clone(),
+                                    fast_socks5::client::Config::default(),
+                                ),
+                            )
+                            .await
+                        }
+                    };
+                    match res {
+                        Ok(Ok(stream)) => {
+                            success_stream = Some(stream);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            last_err = anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e);
+                        }
+                        Err(_) => {
+                            last_err = anyhow::anyhow!("SOCKS5 upstream connect timed out after 8s");
+                        }
+                    }
+                }
+                match success_stream {
+                    Some(stream) => {
                         let (r, w) = tokio::io::split(stream);
                         Ok((Box::new(r), Box::new(w)))
                     }
-                    Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
-                    Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
+                    None => Err(last_err),
                 }
             } else {
                 eprintln!("[RELAY {}] Using upstream proxy {} (unauthenticated)", sid, proxy.address);
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(10),
-                    fast_socks5::client::Socks5Stream::connect(
-                        &proxy.address,
-                        target_dest.to_string(),
-                        target_port,
-                        fast_socks5::client::Config::default(),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => {
+                let mut last_err = anyhow::anyhow!("SOCKS5 connect failed");
+                let mut success_stream = None;
+                for attempt in 0..2 {
+                    if attempt > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    }
+                    let res = match resolved_sa {
+                        Some(sa) => {
+                            tokio::time::timeout(
+                                tokio::time::Duration::from_secs(8),
+                                fast_socks5::client::Socks5Stream::connect(
+                                    sa,
+                                    target_dest.to_string(),
+                                    target_port,
+                                    fast_socks5::client::Config::default(),
+                                ),
+                            )
+                            .await
+                        }
+                        None => {
+                            tokio::time::timeout(
+                                tokio::time::Duration::from_secs(8),
+                                fast_socks5::client::Socks5Stream::connect(
+                                    &proxy.address,
+                                    target_dest.to_string(),
+                                    target_port,
+                                    fast_socks5::client::Config::default(),
+                                ),
+                            )
+                            .await
+                        }
+                    };
+                    match res {
+                        Ok(Ok(stream)) => {
+                            success_stream = Some(stream);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            last_err = anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e);
+                        }
+                        Err(_) => {
+                            last_err = anyhow::anyhow!("SOCKS5 upstream connect timed out after 8s");
+                        }
+                    }
+                }
+                match success_stream {
+                    Some(stream) => {
                         let (r, w) = tokio::io::split(stream);
                         Ok((Box::new(r), Box::new(w)))
                     }
-                    Ok(Err(e)) => Err(anyhow::anyhow!("SOCKS5 upstream connect failed: {:?}", e)),
-                    Err(_) => Err(anyhow::anyhow!("SOCKS5 upstream connect timed out after 10s")),
+                    None => Err(last_err),
                 }
             }
         }
@@ -1078,7 +1193,14 @@ async fn run_stream_relay(
             streams
         }
         Err(e) => {
-            eprintln!("[RELAY {}] Connect failed: {}", sid, e);
+            let err_msg = e.to_string();
+            eprintln!("[RELAY {}] Connect failed: {}", sid, err_msg);
+            let m = serde_json::json!({
+                "type": "relay_error",
+                "session_id": &sid,
+                "error": err_msg,
+            });
+            let _ = relay_tx.send(Message::Text(serde_json::to_string(&m).unwrap_or_default()));
             return;
         }
     };
@@ -1108,7 +1230,15 @@ async fn run_stream_relay(
             let mut buf = vec![0u8; 8192];
             loop {
                 match tokio::io::AsyncReadExt::read(&mut tcp_r, &mut buf).await {
-                    Ok(0) => { eprintln!("[RELAY {}] TCP closed", sid2); break; }
+                    Ok(0) => {
+                        eprintln!("[RELAY {}] TCP closed", sid2);
+                        let m = serde_json::json!({
+                            "type": "relay_close",
+                            "session_id": &sid2,
+                        });
+                        let _ = tx2.send(Message::Text(serde_json::to_string(&m).unwrap_or_default()));
+                        break;
+                    }
                     Ok(n) => {
                         *deadline.lock().unwrap() = tokio::time::Instant::now() + IDLE_TIMEOUT;
                         let enc = base64_encode(&buf[..n]);
@@ -1117,12 +1247,23 @@ async fn run_stream_relay(
                             break;
                         }
                     }
-                    Err(e) => { eprintln!("[RELAY {}] Read error: {}", sid2, e); break; }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        eprintln!("[RELAY {}] Read error: {}", sid2, err_msg);
+                        let m = serde_json::json!({
+                            "type": "relay_error",
+                            "session_id": &sid2,
+                            "error": err_msg,
+                        });
+                        let _ = tx2.send(Message::Text(serde_json::to_string(&m).unwrap_or_default()));
+                        break;
+                    }
                 }
             }
         }
     };
 
+    let tx3 = relay_tx.clone();
     let ws_to_tcp = {
         let deadline = deadline.clone();
         let sid = sid3;
@@ -1131,6 +1272,12 @@ async fn run_stream_relay(
                 *deadline.lock().unwrap() = tokio::time::Instant::now() + IDLE_TIMEOUT;
                 if tokio::io::AsyncWriteExt::write_all(&mut tcp_w, &data).await.is_err() {
                     eprintln!("[RELAY {}] Write failed", sid);
+                    let m = serde_json::json!({
+                        "type": "relay_error",
+                        "session_id": &sid,
+                        "error": "TCP write failed",
+                    });
+                    let _ = tx3.send(Message::Text(serde_json::to_string(&m).unwrap_or_default()));
                     break;
                 }
             }
@@ -1157,6 +1304,11 @@ async fn run_stream_relay(
         _ = ws_to_tcp => {}
         _ = idle_waiter => {
             eprintln!("[RELAY {}] Idle timeout — closing", sid);
+            let m = serde_json::json!({
+                "type": "relay_close",
+                "session_id": &sid,
+            });
+            let _ = relay_tx.send(Message::Text(serde_json::to_string(&m).unwrap_or_default()));
         }
     }
     eprintln!("[RELAY {}] Closed", sid);
@@ -3342,6 +3494,28 @@ mod tests {
             .expect("relay must not panic");
 
         assert!(relay_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_stream_relay_sends_relay_error_on_connect_failure() {
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (_tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Connect to a non-existent port on localhost without upstream proxy
+        let sid = "test_fail_sid";
+        run_stream_relay("127.0.0.1", "127.0.0.1", 1, None, &relay_tx, tcp_rx, sid).await;
+
+        let msg = relay_rx.recv().await.expect("must receive relay_error");
+        match msg {
+            Message::Text(txt) => {
+                let json: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                assert_eq!(json["type"], "relay_error");
+                assert_eq!(json["session_id"], sid);
+                let err_str = json["error"].as_str().unwrap().to_lowercase();
+                assert!(err_str.contains("connect") || err_str.contains("failed") || err_str.contains("refused"));
+            }
+            _ => panic!("Expected Message::Text"),
+        }
     }
 
     #[test]
