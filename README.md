@@ -127,6 +127,7 @@ Backend Relay  ◄───►│  │ Upstream Path 0 │ ───►  │ SOC
    - Runs both direct bandwidth and multiple upstream proxies concurrently under the same seller account.
 4. **Upstream-Only Mode (`--no-direct`)**:
    - Shuts off direct traffic through the node's local IP. All buyer sessions are strictly routed through the configured upstream proxies.
+   - At least one upstream proxy is required; seller startup fails fast when none are configured.
 
 ---
 

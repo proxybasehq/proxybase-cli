@@ -503,11 +503,14 @@ fn build_paths(upstreams: &[UpstreamProxy], include_direct: bool) -> Vec<(String
     for (i, u) in upstreams.iter().enumerate() {
         paths.push((format!("upstream_{}", i), Some(u.clone())));
     }
-    if paths.is_empty() {
-        // At least one path — direct with no upstream
-        paths.push(("direct".to_string(), None));
-    }
     paths
+}
+
+fn validate_seller_paths(upstreams: &[UpstreamProxy], include_direct: bool) -> Result<()> {
+    if !include_direct && upstreams.is_empty() {
+        anyhow::bail!("At least one upstream proxy is required when direct mode is disabled");
+    }
+    Ok(())
 }
 
 /// Shared async seller entry point. In multiplexed mode (default for >1 path),
@@ -2380,7 +2383,7 @@ async fn main() -> Result<()> {
                     let has_explicit_args = has_upstream_args || volunteer || no_direct || no_multiplex;
 
                     let config = if has_explicit_args {
-                        let cfg = SellerConfig {
+                        SellerConfig {
                             upstream_proxies: if has_upstream_args {
                                 collected_proxies.iter().map(|p| UpstreamProxyConfig {
                                     address: p.address.clone(),
@@ -2397,17 +2400,11 @@ async fn main() -> Result<()> {
                             volunteer,
                             no_multiplex,
                             upstream_file: upstream_file.as_ref().map(|p| p.to_string_lossy().to_string()),
-                        };
-                        save_seller_config(&cfg)?;
-                        cfg
+                        }
                     } else {
                         // Direct-only default start (or foreground service manager start):
                         // load saved config or create and persist default direct-only config.
-                        let cfg = load_seller_config_or_default();
-                        if !seller_config_path().exists() {
-                            let _ = save_seller_config(&cfg);
-                        }
-                        cfg
+                        load_seller_config_or_default()
                     };
 
                     let (proxies, include_direct, volunteer_mode) = {
@@ -2422,6 +2419,13 @@ async fn main() -> Result<()> {
                         let include = !config.no_direct;
                         (p, include, config.volunteer)
                     };
+
+                    validate_seller_paths(&proxies, include_direct)?;
+                    if has_explicit_args {
+                        save_seller_config(&config)?;
+                    } else if !seller_config_path().exists() {
+                        let _ = save_seller_config(&config);
+                    }
 
                     let total_paths = proxies.len() + if include_direct { 1 } else { 0 };
                     match (include_direct, proxies.len()) {
@@ -2995,10 +2999,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_paths_empty_without_direct_still_gives_direct() {
-        let paths = build_paths(&[], false);
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].0, "direct");
+    fn test_validate_seller_paths_rejects_empty_without_direct() {
+        assert!(validate_seller_paths(&[], false).is_err());
+    }
+
+    #[test]
+    fn test_build_paths_empty_without_direct_returns_no_paths() {
+        assert!(build_paths(&[], false).is_empty());
     }
 
     #[test]
