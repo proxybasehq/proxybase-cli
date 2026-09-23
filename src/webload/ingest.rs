@@ -320,4 +320,78 @@ malformed_proxy_line_without_port
         // Clean up
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
+
+    #[tokio::test]
+    async fn test_streaming_ingestion_cancellation() {
+        let temp_dir = std::env::temp_dir().join(format!("webload_cancel_{}", uuid::Uuid::new_v4()));
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+        let test_file = temp_dir.join("many_proxies.txt");
+
+        // Write a test file with proxies
+        let mut content = String::new();
+        for i in 1..=500 {
+            content.push_str(&format!("10.10.{}.{}:1080:user:pass\n", i / 256, i % 256));
+        }
+        tokio::fs::write(&test_file, content).await.unwrap();
+
+        let db = WebloadDb::memory().unwrap();
+        let route_table = ActiveRouteTable::new();
+        let (tx, mut rx) = broadcast::channel(100);
+
+        let mgr = IngestionManager::new(db.clone(), route_table.clone(), tx);
+        let cancel = CancellationToken::new();
+
+        // Cancel token so it stops on first line
+        cancel.cancel();
+
+        mgr.ingest_file("job_cancel".to_string(), test_file.clone(), cancel.clone()).await.unwrap();
+
+        let mut got_cancelled = false;
+        let timeout_result = tokio::time::timeout(tokio::time::Duration::from_secs(3), async {
+            while let Ok(evt) = rx.recv().await {
+                if evt.status == "cancelled" {
+                    got_cancelled = true;
+                    break;
+                } else if evt.status == "completed" || evt.status == "failed" {
+                    break;
+                }
+            }
+        }).await;
+
+        assert!(timeout_result.is_ok(), "Timed out waiting for cancellation event");
+        assert!(got_cancelled, "Expected cancellation event to be emitted");
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_streaming_ingestion_missing_file() {
+        let db = WebloadDb::memory().unwrap();
+        let route_table = ActiveRouteTable::new();
+        let (tx, mut rx) = broadcast::channel(100);
+
+        let mgr = IngestionManager::new(db, route_table, tx);
+        let cancel = CancellationToken::new();
+
+        let missing = PathBuf::from("/non/existent/path/proxies.txt");
+        mgr.ingest_file("job_missing".to_string(), missing, cancel).await.unwrap();
+
+        let mut got_failed = false;
+        while let Ok(evt) = rx.recv().await {
+            if evt.status == "failed" {
+                assert!(evt.error_message.is_some());
+                got_failed = true;
+                break;
+            }
+        }
+        assert!(got_failed, "Expected failed event for non-existent file");
+    }
+
+    #[tokio::test]
+    async fn test_probe_proxy_endpoint_unreachable() {
+        // Probe an unreachable local port
+        let (success, lat, err) = probe_proxy_endpoint("127.0.0.1:59999", None, None, 1).await;
+        assert!(!success);
+        assert!(lat.is_none());
+        assert!(err.is_some());
+    }
 }

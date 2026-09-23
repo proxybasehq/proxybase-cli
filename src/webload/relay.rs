@@ -213,4 +213,76 @@ mod tests {
         let telem2 = table.get_telemetry().await;
         assert_eq!(telem2.active_streams, 0);
     }
+
+    #[tokio::test]
+    async fn test_selective_stream_abort() {
+        let table = ActiveRouteTable::new();
+        let cancel_p1 = CancellationToken::new();
+        let cancel_p2 = CancellationToken::new();
+
+        table.populate(vec![
+            ("p_1".to_string(), make_test_proxy("1.1.1.1:1080")),
+            ("p_2".to_string(), make_test_proxy("1.1.1.2:1080")),
+        ]).await;
+
+        table.register_stream("s_1", "p_1", cancel_p1.clone()).await;
+        table.register_stream("s_2", "p_2", cancel_p2.clone()).await;
+
+        // Deactivate ONLY p_1 with abort_streams = true
+        table.deactivate_proxy("p_1", true).await;
+
+        // p_1 stream MUST be cancelled
+        assert!(cancel_p1.is_cancelled());
+        // p_2 stream MUST NOT be cancelled
+        assert!(!cancel_p2.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_streams_and_byte_counters() {
+        let table = ActiveRouteTable::new();
+
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let tbl = table.clone();
+            let handle = tokio::spawn(async move {
+                let sid = format!("stream_{}", i);
+                let cancel = CancellationToken::new();
+                tbl.register_stream(&sid, "p_shared", cancel).await;
+                tbl.record_bytes(1024);
+                tbl.unregister_stream(&sid).await;
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let telem = table.get_telemetry().await;
+        assert_eq!(telem.active_streams, 0);
+        assert_eq!(telem.total_streams_relayed, 50);
+        assert_eq!(telem.total_bytes_relayed, 50 * 1024);
+
+        // Throughput tick returns and swaps 0
+        let tick = table.tick_throughput_rate();
+        assert_eq!(tick, 50 * 1024);
+        let telem_after_tick = table.get_telemetry().await;
+        assert_eq!(telem_after_tick.bytes_per_sec, 0);
+    }
+
+    #[tokio::test]
+    async fn test_seller_relay_running_watch() {
+        let table = ActiveRouteTable::new();
+        let mut watch = table.is_running_watch();
+
+        assert!(!*watch.borrow());
+
+        table.set_running(true);
+        watch.changed().await.unwrap();
+        assert!(*watch.borrow());
+
+        table.set_running(false);
+        watch.changed().await.unwrap();
+        assert!(!*watch.borrow());
+    }
 }

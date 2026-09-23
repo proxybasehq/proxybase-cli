@@ -403,3 +403,378 @@ async fn handle_sse_events(
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use crate::proxy_parser::ParsedProxy;
+
+    fn make_test_proxy(
+        host: &str,
+        port: u16,
+        user: Option<&str>,
+        country: Option<&str>,
+        cat: Option<&str>,
+    ) -> ParsedProxy {
+        ParsedProxy {
+            address: format!("{}:{}", host, port),
+            host: host.to_string(),
+            port,
+            username: user.map(|s| s.to_string()),
+            password: Some("p".to_string()),
+            country: country.map(|s| s.to_string()),
+            proxy_category: cat.map(|s| s.to_string()),
+            label: None,
+            source_line: None,
+            raw_input: format!("{}:{}", host, port),
+        }
+    }
+
+    async fn setup_test_app() -> (Router, WebloadDb, ActiveRouteTable) {
+        let db = WebloadDb::memory().unwrap();
+        let route_table = ActiveRouteTable::new();
+        let (progress_tx, _) = broadcast::channel(100);
+        let ingest_mgr = Arc::new(IngestionManager::new(
+            db.clone(),
+            route_table.clone(),
+            progress_tx.clone(),
+        ));
+        let active_cancellations = Arc::new(Mutex::new(HashMap::new()));
+
+        let state = AppState {
+            db: db.clone(),
+            route_table: route_table.clone(),
+            ingest_mgr,
+            progress_tx,
+            active_cancellations,
+            backend_url: "http://127.0.0.1:8080".to_string(),
+        };
+
+        (build_router(state), db, route_table)
+    }
+
+    #[tokio::test]
+    async fn test_get_index_and_static_assets() {
+        let (app, _, _) = setup_test_app().await;
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(html.contains("ProxyBase Webload"));
+
+        let req_css = Request::builder().uri("/assets/app.css").body(Body::empty()).unwrap();
+        let res_css = app.clone().oneshot(req_css).await.unwrap();
+        assert_eq!(res_css.status(), StatusCode::OK);
+
+        let req_js = Request::builder().uri("/assets/app.js").body(Body::empty()).unwrap();
+        let res_js = app.clone().oneshot(req_js).await.unwrap();
+        assert_eq!(res_js.status(), StatusCode::OK);
+
+        let req_404 = Request::builder().uri("/assets/non_existent.png").body(Body::empty()).unwrap();
+        let res_404 = app.oneshot(req_404).await.unwrap();
+        assert_eq!(res_404.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_api_proxies_pagination_and_filter() {
+        let (app, db, _) = setup_test_app().await;
+
+        // Seed 30 proxies
+        let mut proxies = Vec::new();
+        for i in 1..=30 {
+            let cc = if i <= 10 { Some("US") } else if i <= 20 { Some("DE") } else { None };
+            let cat = if i % 2 == 0 { Some("residential") } else { Some("datacenter") };
+            proxies.push(make_test_proxy(&format!("10.0.0.{}", i), 1080, Some(&format!("u_{}", i)), cc, cat));
+        }
+        db.insert_batch(&proxies).unwrap();
+
+        // 1. Pagination: page 1 with limit 10
+        let req = Request::builder().uri("/api/proxies?page=1&limit=10").body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 10);
+        assert_eq!(json["total"], 30);
+        assert_eq!(json["total_pages"], 3);
+
+        // 2. Filter by country: US
+        let req_us = Request::builder().uri("/api/proxies?country=US&limit=50").body(Body::empty()).unwrap();
+        let res_us = app.clone().oneshot(req_us).await.unwrap();
+        let body_us = axum::body::to_bytes(res_us.into_body(), usize::MAX).await.unwrap();
+        let json_us: serde_json::Value = serde_json::from_slice(&body_us).unwrap();
+        assert_eq!(json_us["filtered"], 10);
+
+        // 3. Filter by Worldwide (null country)
+        let req_ww = Request::builder().uri("/api/proxies?country=WW&limit=50").body(Body::empty()).unwrap();
+        let res_ww = app.clone().oneshot(req_ww).await.unwrap();
+        let body_ww = axum::body::to_bytes(res_ww.into_body(), usize::MAX).await.unwrap();
+        let json_ww: serde_json::Value = serde_json::from_slice(&body_ww).unwrap();
+        assert_eq!(json_ww["filtered"], 10);
+
+        // 4. Search query
+        let req_search = Request::builder().uri("/api/proxies?search=10.0.0.15").body(Body::empty()).unwrap();
+        let res_search = app.oneshot(req_search).await.unwrap();
+        let body_search = axum::body::to_bytes(res_search.into_body(), usize::MAX).await.unwrap();
+        let json_search: serde_json::Value = serde_json::from_slice(&body_search).unwrap();
+        assert_eq!(json_search["items"].as_array().unwrap().len(), 1);
+        assert_eq!(json_search["items"][0]["address"], "10.0.0.15:1080");
+    }
+
+    #[tokio::test]
+    async fn test_api_toggle_and_bulk_actions() {
+        let (app, db, route_table) = setup_test_app().await;
+
+        let proxies = vec![
+            make_test_proxy("192.168.1.1", 1080, Some("u1"), Some("US"), None),
+            make_test_proxy("192.168.1.2", 1080, Some("u2"), Some("US"), None),
+            make_test_proxy("192.168.1.3", 1080, Some("u3"), Some("US"), None),
+        ];
+        db.insert_batch(&proxies).unwrap();
+        let active = db.get_active_proxies().unwrap();
+        route_table.populate(active).await;
+
+        let page = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        let id1 = page.items[0].id;
+        let path1 = page.items[0].path_id.clone();
+
+        // 1. Toggle proxy 1 to paused
+        let req_toggle = Request::builder()
+            .method("POST")
+            .uri(format!("/api/proxies/{}/toggle", id1))
+            .body(Body::empty())
+            .unwrap();
+        let res_toggle = app.clone().oneshot(req_toggle).await.unwrap();
+        assert_eq!(res_toggle.status(), StatusCode::OK);
+        let body_toggle = axum::body::to_bytes(res_toggle.into_body(), usize::MAX).await.unwrap();
+        let json_toggle: serde_json::Value = serde_json::from_slice(&body_toggle).unwrap();
+        assert_eq!(json_toggle["new_status"], "paused");
+        assert!(!route_table.is_active(&path1).await);
+
+        // 2. Bulk pause remaining
+        let id2 = page.items[1].id;
+        let id3 = page.items[2].id;
+        let bulk_body = serde_json::json!({
+            "action": "pause",
+            "ids": [id2, id3]
+        });
+        let req_bulk = Request::builder()
+            .method("POST")
+            .uri("/api/proxies/bulk")
+            .header("Content-Type", "application/json")
+            .body(Body::from(bulk_body.to_string()))
+            .unwrap();
+        let res_bulk = app.clone().oneshot(req_bulk).await.unwrap();
+        assert_eq!(res_bulk.status(), StatusCode::OK);
+
+        let stats = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats.active_proxies, 0);
+        assert_eq!(stats.paused_proxies, 3);
+
+        // 3. Bulk resume
+        let bulk_resume_body = serde_json::json!({
+            "action": "resume",
+            "ids": [id1, id2, id3]
+        });
+        let req_resume = Request::builder()
+            .method("POST")
+            .uri("/api/proxies/bulk")
+            .header("Content-Type", "application/json")
+            .body(Body::from(bulk_resume_body.to_string()))
+            .unwrap();
+        let res_resume = app.clone().oneshot(req_resume).await.unwrap();
+        assert_eq!(res_resume.status(), StatusCode::OK);
+        assert!(route_table.is_active(&path1).await);
+
+        // 4. Delete proxy 1
+        let req_del = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/proxies/{}", id1))
+            .body(Body::empty())
+            .unwrap();
+        let res_del = app.oneshot(req_del).await.unwrap();
+        assert_eq!(res_del.status(), StatusCode::NO_CONTENT);
+        assert!(!route_table.is_active(&path1).await);
+    }
+
+    #[tokio::test]
+    async fn test_api_stats_and_seller_toggle() {
+        let (app, db, route_table) = setup_test_app().await;
+
+        let proxies = vec![
+            make_test_proxy("5.5.5.1", 1080, Some("u1"), Some("JP"), None),
+            make_test_proxy("5.5.5.2", 1080, Some("u2"), None, None),
+        ];
+        db.insert_batch(&proxies).unwrap();
+
+        // Stats
+        let req_stats = Request::builder().uri("/api/stats").body(Body::empty()).unwrap();
+        let res_stats = app.clone().oneshot(req_stats).await.unwrap();
+        assert_eq!(res_stats.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res_stats.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_proxies"], 2);
+        assert_eq!(json["active_proxies"], 2);
+
+        // Seller toggle
+        assert!(!*route_table.is_running_watch().borrow());
+        let req_toggle = Request::builder().method("POST").uri("/api/seller/toggle").body(Body::empty()).unwrap();
+        let res_toggle = app.clone().oneshot(req_toggle).await.unwrap();
+        assert_eq!(res_toggle.status(), StatusCode::OK);
+        assert!(*route_table.is_running_watch().borrow());
+    }
+
+    #[tokio::test]
+    async fn test_api_load_proxies_direct_content() {
+        let (app, db, _) = setup_test_app().await;
+
+        let payload = serde_json::json!({
+            "raw_content": "100.64.0.1:1080:user:pass\n100.64.0.2:1080:user:pass # US\n100.64.0.3:1080:user:pass"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/proxies/load")
+            .header("Content-Type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "started");
+        assert!(json["job_id"].as_str().is_some());
+
+        // Wait brief moment for background ingestion task to complete
+        for _ in 0..50 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            let stats = db.get_aggregate_stats().unwrap();
+            if stats.total_proxies == 3 {
+                break;
+            }
+        }
+
+        let stats = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats.total_proxies, 3);
+    }
+
+    #[tokio::test]
+    async fn test_api_cancel_job() {
+        let (app, _, _) = setup_test_app().await;
+
+        // 1. Cancel non-existent job -> 404
+        let req_missing = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/job_unknown/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let res_missing = app.clone().oneshot(req_missing).await.unwrap();
+        assert_eq!(res_missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_api_bulk_delete() {
+        let (app, db, route_table) = setup_test_app().await;
+
+        let proxies = vec![
+            make_test_proxy("8.8.8.1", 1080, Some("u1"), Some("US"), None),
+            make_test_proxy("8.8.8.2", 1080, Some("u2"), Some("US"), None),
+        ];
+        db.insert_batch(&proxies).unwrap();
+        let active = db.get_active_proxies().unwrap();
+        route_table.populate(active).await;
+
+        let page = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        let ids: Vec<i64> = page.items.iter().map(|p| p.id).collect();
+
+        let bulk_body = serde_json::json!({
+            "action": "delete",
+            "ids": ids
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/proxies/bulk")
+            .header("Content-Type", "application/json")
+            .body(Body::from(bulk_body.to_string()))
+            .unwrap();
+
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let stats = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats.total_proxies, 0);
+        assert_eq!(route_table.get_telemetry().await.active_upstream_paths, 0);
+    }
+
+    #[tokio::test]
+    async fn test_api_test_proxy_endpoint() {
+        let (app, db, _) = setup_test_app().await;
+
+        let proxies = vec![make_test_proxy("127.0.0.1", 59998, Some("u"), None, None)];
+        db.insert_batch(&proxies).unwrap();
+        let page = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        let id = page.items[0].id;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/proxies/{}/test", id))
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], id);
+        assert_eq!(json["is_success"], false);
+        assert!(json["error_message"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_api_sse_events_header() {
+        let (app, _, _) = setup_test_app().await;
+
+        let req = Request::builder().uri("/api/events").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let content_type = res.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(content_type.contains("text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn test_api_proxies_sorting() {
+        let (app, db, _) = setup_test_app().await;
+
+        let proxies = vec![
+            make_test_proxy("1.1.1.1", 1080, None, None, None),
+            make_test_proxy("9.9.9.9", 1080, None, None, None),
+        ];
+        db.insert_batch(&proxies).unwrap();
+
+        // Sort by host DESC
+        let req_desc = Request::builder().uri("/api/proxies?sort_by=host&sort_dir=desc").body(Body::empty()).unwrap();
+        let res_desc = app.clone().oneshot(req_desc).await.unwrap();
+        assert_eq!(res_desc.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res_desc.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"][0]["host"], "9.9.9.9");
+        assert_eq!(json["items"][1]["host"], "1.1.1.1");
+
+        // Sort by host ASC
+        let req_asc = Request::builder().uri("/api/proxies?sort_by=host&sort_dir=asc").body(Body::empty()).unwrap();
+        let res_asc = app.oneshot(req_asc).await.unwrap();
+        let body_asc = axum::body::to_bytes(res_asc.into_body(), usize::MAX).await.unwrap();
+        let json_asc: serde_json::Value = serde_json::from_slice(&body_asc).unwrap();
+        assert_eq!(json_asc["items"][0]["host"], "1.1.1.1");
+        assert_eq!(json_asc["items"][1]["host"], "9.9.9.9");
+    }
+}

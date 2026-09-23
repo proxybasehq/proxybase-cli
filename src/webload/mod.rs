@@ -151,3 +151,121 @@ async fn run_seller_supervisor(route_table: ActiveRouteTable, backend_url: Strin
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use db::ProxyQueryFilter;
+
+    #[tokio::test]
+    async fn test_webload_end_to_end_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!("webload_e2e_{}", uuid::Uuid::new_v4()));
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+        let db_path = temp_dir.join("webload_e2e.db");
+        let proxy_file = temp_dir.join("proxies_list.txt");
+
+        // 1. Create a heterogeneous proxy input file
+        let proxy_content = "
+# US Proxies
+192.168.10.1:1080:alice,country_US:pass1 # US Node 1
+192.168.10.2:1080:bob,country_US:pass2 # US Node 2
+# European proxies
+socks5://carol:pass3@192.168.10.3:1080?country=DE&category=datacenter
+dave:pass4:192.168.10.4:1080 # Inverted format
+# Worldwide proxy without country
+192.168.10.5:1080:eve:pass5
+# Malformed line that should be skipped as warning
+malformed_line_no_port
+";
+        tokio::fs::write(&proxy_file, proxy_content).await.unwrap();
+
+        // 2. Initialize DB & route table
+        let db = WebloadDb::new(&db_path).unwrap();
+        let route_table = ActiveRouteTable::new();
+        let (tx, mut rx) = broadcast::channel(100);
+
+        let ingest_mgr = IngestionManager::new(db.clone(), route_table.clone(), tx);
+        let cancel = CancellationToken::new();
+
+        // 3. Ingest file and wait for completion
+        ingest_mgr.ingest_file("e2e_job".to_string(), proxy_file, cancel).await.unwrap();
+
+        let mut completed = false;
+        let timeout_res = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            while let Ok(evt) = rx.recv().await {
+                if evt.status == "completed" {
+                    assert_eq!(evt.valid_count, 5);
+                    assert_eq!(evt.warning_count, 1);
+                    completed = true;
+                    break;
+                }
+            }
+        }).await;
+
+        assert!(timeout_res.is_ok(), "Ingestion timed out");
+        assert!(completed, "Ingestion did not emit completed status");
+
+        // 4. Verify DB aggregate stats
+        let stats = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats.total_proxies, 5);
+        assert_eq!(stats.active_proxies, 5);
+        assert_eq!(stats.paused_proxies, 0);
+
+        // 5. Verify hot route table is populated
+        let telem = route_table.get_telemetry().await;
+        assert_eq!(telem.active_upstream_paths, 5);
+
+        // 6. Test stopping an upstream proxy individually
+        let page = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        let p1 = &page.items[0];
+        let p1_id = p1.id;
+        let p1_path = p1.path_id.clone();
+
+        // Register a stream on p1
+        let cancel_stream = CancellationToken::new();
+        route_table.register_stream("session_e2e_1", &p1_path, cancel_stream.clone()).await;
+        assert_eq!(route_table.get_telemetry().await.active_streams, 1);
+
+        // Operator pauses p1 in DB and hot route table
+        let (new_status, _) = db.toggle_proxy_status(p1_id).unwrap();
+        assert_eq!(new_status, "paused");
+        route_table.deactivate_proxy(&p1_path, true).await;
+
+        // Verify p1 stream is immediately aborted and proxy removed from routing
+        assert!(cancel_stream.is_cancelled());
+        assert!(!route_table.is_active(&p1_path).await);
+        assert!(route_table.get_upstream(&p1_path).await.is_none());
+
+        // 7. Operator resumes p1
+        let (resumed_status, _) = db.toggle_proxy_status(p1_id).unwrap();
+        assert_eq!(resumed_status, "active");
+        let active_list = db.get_active_proxies().unwrap();
+        let (_, resumed_upstream) = active_list.into_iter().find(|(pid, _)| pid == &p1_path).unwrap();
+        route_table.activate_proxy(&p1_path, resumed_upstream).await;
+        assert!(route_table.is_active(&p1_path).await);
+
+        // 8. Bulk pause by country (pause all 'US' proxies)
+        let filter_us = ProxyQueryFilter {
+            country: Some("US".to_string()),
+            ..Default::default()
+        };
+        let paused_paths = db.bulk_update_by_filter(&filter_us, "paused").unwrap();
+        for pid in paused_paths {
+            route_table.deactivate_proxy(&pid, true).await;
+        }
+
+        let stats_after_us = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats_after_us.paused_proxies, 2);
+        assert_eq!(stats_after_us.active_proxies, 3);
+
+        // 9. Reopen DB from disk and verify persistence
+        drop(db);
+        let reopened_db = WebloadDb::new(&db_path).unwrap();
+        let reopened_stats = reopened_db.get_aggregate_stats().unwrap();
+        assert_eq!(reopened_stats.total_proxies, 5);
+        assert_eq!(reopened_stats.paused_proxies, 2);
+        assert_eq!(reopened_stats.active_proxies, 3);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+}

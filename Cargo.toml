@@ -1,6 +1,6 @@
 [package]
 name = "proxybase-cli"
-version = "0.1.49"
+version = "0.1.50"
 edition = "2021"
 description = "Official ProxyBase command-line client"
 license = "MIT"
@@ -31,7 +31,7 @@ semver = "1"
 sha2 = "0.10"
 libc = "0.2"
 axum = { version = "0.7", features = ["ws", "multipart"] }
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }

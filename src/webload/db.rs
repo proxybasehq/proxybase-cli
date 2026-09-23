@@ -766,4 +766,207 @@ mod tests {
         assert_eq!(stats_paused.paused_proxies, 2);
         assert_eq!(stats_paused.active_proxies, 0);
     }
+
+    #[test]
+    fn test_circuit_breaker_3_consecutive_failures() {
+        let db = WebloadDb::memory().unwrap();
+        let proxies = vec![make_test_proxy("3.3.3.1", 1080, Some("user"), Some("US"))];
+        db.insert_batch(&proxies).unwrap();
+
+        let list = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        let id = list.items[0].id;
+        assert_eq!(list.items[0].status, "active");
+        assert_eq!(list.items[0].consecutive_failures, 0);
+
+        // Failure 1: status should still be active
+        db.update_proxy_test_result(id, None, false).unwrap();
+        let list1 = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        assert_eq!(list1.items[0].status, "active");
+        assert_eq!(list1.items[0].consecutive_failures, 1);
+
+        // Failure 2: status should still be active
+        db.update_proxy_test_result(id, None, false).unwrap();
+        let list2 = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        assert_eq!(list2.items[0].status, "active");
+        assert_eq!(list2.items[0].consecutive_failures, 2);
+
+        // Failure 3: circuit breaker trips! status becomes 'error'
+        db.update_proxy_test_result(id, None, false).unwrap();
+        let list3 = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        assert_eq!(list3.items[0].status, "error");
+        assert_eq!(list3.items[0].consecutive_failures, 3);
+
+        // Probe succeeds: circuit breaker recovers! consecutive_failures resets to 0, status recovers to 'active'
+        db.update_proxy_test_result(id, Some(45), true).unwrap();
+        let list4 = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        assert_eq!(list4.items[0].status, "active");
+        assert_eq!(list4.items[0].consecutive_failures, 0);
+        assert_eq!(list4.items[0].last_latency_ms, Some(45));
+    }
+
+    #[test]
+    fn test_bulk_update_by_filter() {
+        let db = WebloadDb::memory().unwrap();
+        let proxies = vec![
+            make_test_proxy("4.4.4.1", 1080, Some("u1"), Some("US")),
+            make_test_proxy("4.4.4.2", 1080, Some("u2"), Some("US")),
+            make_test_proxy("4.4.4.3", 1080, Some("u3"), Some("DE")),
+        ];
+        db.insert_batch(&proxies).unwrap();
+
+        // Pause all proxies with country = 'US'
+        let filter_us = ProxyQueryFilter {
+            country: Some("US".to_string()),
+            ..Default::default()
+        };
+        let updated_paths = db.bulk_update_by_filter(&filter_us, "paused").unwrap();
+        assert_eq!(updated_paths.len(), 2);
+
+        let stats = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats.active_proxies, 1); // DE remains active
+        assert_eq!(stats.paused_proxies, 2); // US paused
+    }
+
+    #[test]
+    fn test_delete_proxy() {
+        let db = WebloadDb::memory().unwrap();
+        let proxies = vec![make_test_proxy("5.5.5.1", 1080, Some("u"), Some("US"))];
+        db.insert_batch(&proxies).unwrap();
+
+        let list = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        let id = list.items[0].id;
+
+        // Delete existing proxy
+        let deleted_path = db.delete_proxy(id).unwrap();
+        assert!(deleted_path.is_some());
+
+        // Verify count is 0
+        let stats = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats.total_proxies, 0);
+
+        // Deleting non-existent returns None
+        let deleted_again = db.delete_proxy(9999).unwrap();
+        assert!(deleted_again.is_none());
+    }
+
+    #[test]
+    fn test_get_active_proxies() {
+        let db = WebloadDb::memory().unwrap();
+        let proxies = vec![
+            make_test_proxy("6.6.6.1", 1080, Some("u1"), Some("US")),
+            make_test_proxy("6.6.6.2", 1080, Some("u2"), Some("FR")),
+            make_test_proxy("6.6.6.3", 1080, Some("u3"), Some("JP")),
+        ];
+        db.insert_batch(&proxies).unwrap();
+
+        // Initially all 3 are active
+        let active = db.get_active_proxies().unwrap();
+        assert_eq!(active.len(), 3);
+
+        // Pause proxy 2
+        let list = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        let id2 = list.items[1].id;
+        db.toggle_proxy_status(id2).unwrap();
+
+        // Trip proxy 3 to error
+        let id3 = list.items[2].id;
+        db.set_proxy_status(id3, "error").unwrap();
+
+        // Only proxy 1 should be returned by get_active_proxies
+        let active_after = db.get_active_proxies().unwrap();
+        assert_eq!(active_after.len(), 1);
+        assert_eq!(active_after[0].1.address, "6.6.6.1:1080");
+    }
+
+    #[test]
+    fn test_sorting_options() {
+        let db = WebloadDb::memory().unwrap();
+        let proxies = vec![
+            make_test_proxy("10.0.0.1", 1080, Some("u1"), Some("US")),
+            make_test_proxy("10.0.0.2", 1080, Some("u2"), Some("DE")),
+            make_test_proxy("10.0.0.3", 1080, Some("u3"), Some("FR")),
+        ];
+        db.insert_batch(&proxies).unwrap();
+
+        let list = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
+        // Give them different latencies: id 1 -> 300ms, id 2 -> 50ms, id 3 -> 150ms
+        db.update_proxy_test_result(list.items[0].id, Some(300), true).unwrap();
+        db.update_proxy_test_result(list.items[1].id, Some(50), true).unwrap();
+        db.update_proxy_test_result(list.items[2].id, Some(150), true).unwrap();
+
+        // Sort by latency ASC
+        let filter_asc = ProxyQueryFilter {
+            sort_by: Some("latency".to_string()),
+            sort_dir: Some("asc".to_string()),
+            ..Default::default()
+        };
+        let res_asc = db.query_proxies(&filter_asc).unwrap();
+        assert_eq!(res_asc.items[0].last_latency_ms, Some(50));
+        assert_eq!(res_asc.items[1].last_latency_ms, Some(150));
+        assert_eq!(res_asc.items[2].last_latency_ms, Some(300));
+
+        // Sort by latency DESC
+        let filter_desc = ProxyQueryFilter {
+            sort_by: Some("latency".to_string()),
+            sort_dir: Some("desc".to_string()),
+            ..Default::default()
+        };
+        let res_desc = db.query_proxies(&filter_desc).unwrap();
+        assert_eq!(res_desc.items[0].last_latency_ms, Some(300));
+        assert_eq!(res_desc.items[1].last_latency_ms, Some(150));
+        assert_eq!(res_desc.items[2].last_latency_ms, Some(50));
+    }
+
+    #[test]
+    fn test_disk_persisted_db_creation() {
+        let temp_dir = std::env::temp_dir().join(format!("webload_db_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let db_path = temp_dir.join("proxies.db");
+
+        {
+            let db = WebloadDb::new(&db_path).unwrap();
+            let proxies = vec![
+                make_test_proxy("7.7.7.1", 1080, Some("u1"), Some("US")),
+                make_test_proxy("7.7.7.2", 1080, Some("u2"), Some("UK")),
+            ];
+            let (ins, _) = db.insert_batch(&proxies).unwrap();
+            assert_eq!(ins, 2);
+        } // db connection drops here
+
+        // Reopen from disk file
+        {
+            let reopened_db = WebloadDb::new(&db_path).unwrap();
+            let stats = reopened_db.get_aggregate_stats().unwrap();
+            assert_eq!(stats.total_proxies, 2);
+            assert_eq!(stats.active_proxies, 2);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_large_batch_scale() {
+        let db = WebloadDb::memory().unwrap();
+        let mut large_batch = Vec::with_capacity(5_000);
+        for i in 1..=5_000 {
+            large_batch.push(make_test_proxy(
+                &format!("172.16.{}.{}", i / 256, i % 256),
+                1080,
+                Some(&format!("user_{}", i)),
+                Some("US"),
+            ));
+        }
+
+        let start = std::time::Instant::now();
+        let (inserted, dups) = db.insert_batch(&large_batch).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(inserted, 5_000);
+        assert_eq!(dups, 0);
+        // Ensure 5k batch executes quickly (well under 500ms on modern systems)
+        assert!(elapsed.as_millis() < 1000, "5,000 batch insert took too long: {:?}", elapsed);
+
+        let stats = db.get_aggregate_stats().unwrap();
+        assert_eq!(stats.total_proxies, 5_000);
+    }
 }
