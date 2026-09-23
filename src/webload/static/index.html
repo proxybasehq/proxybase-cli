@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ProxyBase Webload — Bulk Upstream Proxy Manager</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Top Navigation / Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="brand">
+          <div class="brand-logo">
+            <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+            </svg>
+          </div>
+          <div class="brand-info">
+            <span class="brand-name">ProxyBase <span class="brand-highlight">Webload</span></span>
+            <span class="brand-tag">v2.0 High-Capacity Engine</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Telemetry Counters in Header -->
+      <div class="header-stats">
+        <div class="stat-pill">
+          <span class="stat-label">Total Proxies</span>
+          <span class="stat-value" id="stat-total">0</span>
+        </div>
+        <div class="stat-pill success">
+          <span class="stat-label">Active Upstreams</span>
+          <span class="stat-value" id="stat-active">0</span>
+        </div>
+        <div class="stat-pill warning">
+          <span class="stat-label">Paused</span>
+          <span class="stat-value" id="stat-paused">0</span>
+        </div>
+        <div class="stat-pill danger">
+          <span class="stat-label">Errors</span>
+          <span class="stat-value" id="stat-error">0</span>
+        </div>
+        <div class="stat-pill info">
+          <span class="stat-label">Active Streams</span>
+          <span class="stat-value" id="stat-streams">0</span>
+        </div>
+        <div class="stat-pill purple">
+          <span class="stat-label">Throughput</span>
+          <span class="stat-value" id="stat-throughput">0 KB/s</span>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button id="btn-open-ingest" class="btn btn-primary">
+          <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <span>Load Proxies</span>
+        </button>
+        <button id="btn-toggle-relay" class="btn btn-secondary">
+          <span class="relay-indicator" id="relay-status-dot"></span>
+          <span id="relay-btn-text">Seller Offline</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="app-main">
+      <!-- Ingestion Banner (shown when active) -->
+      <div id="ingest-banner" class="ingest-banner hidden">
+        <div class="ingest-content">
+          <div class="ingest-header">
+            <div class="ingest-title">
+              <span class="spinner"></span>
+              <span>Streaming Proxy Ingestion in Progress...</span>
+            </div>
+            <div class="ingest-rate" id="ingest-rate-text">0 lines/sec</div>
+            <button id="btn-cancel-ingest" class="btn btn-xs btn-danger">Cancel</button>
+          </div>
+          <div class="progress-bar-container">
+            <div id="ingest-progress-bar" class="progress-bar-fill" style="width: 0%"></div>
+          </div>
+          <div class="ingest-stats">
+            <span>Read: <strong id="ingest-lines-read">0</strong></span>
+            <span>Valid: <strong id="ingest-valid-count">0</strong></span>
+            <span>Deduplicated: <strong id="ingest-dup-count">0</strong></span>
+            <span>Warnings: <strong id="ingest-warn-count">0</strong></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Controls & Filter Toolbar -->
+      <section class="toolbar">
+        <div class="toolbar-search">
+          <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="search-input" placeholder="Search by host, port, username, or label..." autocomplete="off">
+          <button id="search-clear" class="btn-clear hidden">&times;</button>
+        </div>
+
+        <div class="toolbar-filters">
+          <!-- Status Filter Tabs -->
+          <div class="filter-group">
+            <div class="filter-pills" id="status-filter-pills">
+              <button class="pill active" data-status="all">All</button>
+              <button class="pill" data-status="active">Active</button>
+              <button class="pill" data-status="paused">Paused</button>
+              <button class="pill" data-status="error">Error</button>
+            </div>
+          </div>
+
+          <!-- Country Filter Dropdown -->
+          <div class="filter-select-wrapper">
+            <select id="country-select">
+              <option value="all">All Countries</option>
+              <option value="WW">🌐 Worldwide / Unspecified</option>
+            </select>
+          </div>
+
+          <!-- Category Filter Dropdown -->
+          <div class="filter-select-wrapper">
+            <select id="category-select">
+              <option value="all">All Categories</option>
+              <option value="residential">Residential</option>
+              <option value="datacenter">Datacenter</option>
+              <option value="mobile">Mobile</option>
+            </select>
+          </div>
+
+          <!-- Page Size Selector -->
+          <div class="filter-select-wrapper">
+            <select id="limit-select">
+              <option value="25">25 per page</option>
+              <option value="50" selected>50 per page</option>
+              <option value="100">100 per page</option>
+              <option value="500">500 per page</option>
+              <option value="1000">1000 per page</option>
+            </select>
+          </div>
+
+          <button id="btn-refresh" class="btn btn-icon" title="Refresh Table">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+              <path d="M23 4v6h-6M1 20v-6h6"/>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+            </svg>
+          </button>
+        </div>
+      </section>
+
+      <!-- Bulk Actions Bar (Sticky floating bar when items selected) -->
+      <div id="bulk-bar" class="bulk-bar hidden">
+        <div class="bulk-info">
+          <span id="bulk-selected-count">0</span> proxies selected on this page
+          <button id="btn-select-all-filtered" class="btn-link">Select all matching proxies</button>
+        </div>
+        <div class="bulk-actions">
+          <button id="btn-bulk-pause" class="btn btn-sm btn-warning">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+              <rect x="6" y="4" width="4" height="16"/>
+              <rect x="14" y="4" width="4" height="16"/>
+            </svg>
+            Stop Selected
+          </button>
+          <button id="btn-bulk-resume" class="btn btn-sm btn-success">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            Resume Selected
+          </button>
+          <button id="btn-bulk-delete" class="btn btn-sm btn-danger">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Delete
+          </button>
+          <button id="btn-bulk-clear" class="btn btn-sm btn-secondary">Deselect</button>
+        </div>
+      </div>
+
+      <!-- Proxy Data Table -->
+      <div class="table-container">
+        <table class="proxy-table">
+          <thead>
+            <tr>
+              <th class="col-checkbox">
+                <input type="checkbox" id="th-checkbox">
+              </th>
+              <th class="col-status">Status</th>
+              <th class="col-toggle">Upstream</th>
+              <th class="col-address sortable" data-sort="address">
+                Endpoint Address
+                <span class="sort-icon"></span>
+              </th>
+              <th class="col-auth">Credentials</th>
+              <th class="col-country sortable" data-sort="country">
+                Country
+                <span class="sort-icon"></span>
+              </th>
+              <th class="col-category sortable" data-sort="category">
+                Category
+                <span class="sort-icon"></span>
+              </th>
+              <th class="col-latency sortable" data-sort="latency">
+                Latency
+                <span class="sort-icon"></span>
+              </th>
+              <th class="col-streams sortable" data-sort="streams">
+                Relayed
+                <span class="sort-icon"></span>
+              </th>
+              <th class="col-actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="proxy-tbody">
+            <!-- Dynamic Rows Injected by JS -->
+          </tbody>
+        </table>
+
+        <!-- Empty State -->
+        <div id="table-empty" class="table-empty hidden">
+          <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="1.5" fill="none">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M16 16s-1.5-2-4-2-4 2-4 2"/>
+            <line x1="9" y1="9" x2="9.01" y2="9"/>
+            <line x1="15" y1="9" x2="15.01" y2="9"/>
+          </svg>
+          <h3>No Proxies Found</h3>
+          <p>No proxies match your search criteria. Try adjusting filters or load a proxy list.</p>
+          <button class="btn btn-primary" onclick="document.getElementById('btn-open-ingest').click()">Load Proxy File</button>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div id="table-loading" class="table-loading hidden">
+          <div class="spinner large"></div>
+          <span>Fetching page...</span>
+        </div>
+      </div>
+
+      <!-- Pagination Footer -->
+      <footer class="pagination-footer">
+        <div class="pagination-info" id="pagination-info">
+          Showing 0 - 0 of 0 proxies
+        </div>
+
+        <div class="pagination-controls">
+          <button id="btn-page-first" class="btn btn-icon btn-sm" title="First Page">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+              <polyline points="11 17 6 12 11 7"/>
+              <polyline points="18 17 13 12 18 7"/>
+            </svg>
+          </button>
+          <button id="btn-page-prev" class="btn btn-icon btn-sm" title="Previous Page">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+              <polyline points="15 18 9 12 15 6"/>
+            </svg>
+          </button>
+
+          <div class="page-jump">
+            <span>Page</span>
+            <input type="number" id="page-input" min="1" value="1">
+            <span>of <strong id="page-total-text">1</strong></span>
+          </div>
+
+          <button id="btn-page-next" class="btn btn-icon btn-sm" title="Next Page">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+              <polyline points="9 18 15 12 9 6"/>
+            </svg>
+          </button>
+          <button id="btn-page-last" class="btn btn-icon btn-sm" title="Last Page">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+              <polyline points="13 17 18 12 13 7"/>
+              <polyline points="6 17 11 12 6 7"/>
+            </svg>
+          </button>
+        </div>
+      </footer>
+    </main>
+
+    <!-- Ingestion Modal -->
+    <div id="modal-ingest" class="modal-overlay hidden">
+      <div class="modal-container">
+        <div class="modal-header">
+          <div class="modal-title">
+            <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <h3>Load Proxies Into Storage</h3>
+          </div>
+          <button id="btn-modal-close" class="modal-close">&times;</button>
+        </div>
+
+        <div class="modal-body">
+          <p class="modal-subtitle">
+            Import up to 1,000,000+ SOCKS5 proxies. The streaming parser runs asynchronously without blocking the UI.
+          </p>
+
+          <!-- Tab Selector -->
+          <div class="modal-tabs">
+            <button class="modal-tab active" data-tab="local">Server File Path</button>
+            <button class="modal-tab" data-tab="upload">File Upload</button>
+          </div>
+
+          <!-- Local File Path Tab -->
+          <div id="tab-local" class="modal-tab-pane active">
+            <label for="input-file-path" class="form-label">Absolute or relative file path on server:</label>
+            <input type="text" id="input-file-path" class="form-input" placeholder="/path/to/proxies.txt or ./proxies.txt">
+            <span class="form-hint">Supports formats: <code>host:port:user:pass</code>, <code>socks5://...</code>, <code>user:pass@host:port</code></span>
+          </div>
+
+          <!-- File Upload Tab -->
+          <div id="tab-upload" class="modal-tab-pane hidden">
+            <div id="drop-zone" class="drop-zone">
+              <svg viewBox="0 0 24 24" width="36" height="36" stroke="currentColor" stroke-width="1.5" fill="none">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p>Drag and drop a <code>.txt</code> or <code>.csv</code> proxy file here, or click to browse</p>
+              <input type="file" id="file-upload-input" accept=".txt,.csv" class="hidden">
+            </div>
+            <div id="upload-file-name" class="upload-file-name hidden"></div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button id="btn-modal-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="btn-start-load" class="btn btn-primary">Start Streaming Ingestion</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Notification Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

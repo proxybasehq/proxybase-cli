@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod update;
 mod bridge;
 mod proxy_parser;
+pub mod webload;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
@@ -48,6 +49,27 @@ enum Commands {
     Seller {
         #[command(subcommand)]
         cmd: SellerCmd,
+    },
+    /// Launch embedded bulk proxy management web UI (supports 1M+ proxies with pagination & hot upstream control)
+    Webload {
+        /// Initial proxy file to import
+        #[arg(short, long)]
+        file: Option<std::path::PathBuf>,
+        /// Web UI listening port (default: 8787)
+        #[arg(short, long, default_value = "8787")]
+        port: u16,
+        /// Bind interface (default: 127.0.0.1)
+        #[arg(short, long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Custom SQLite database path (default: ~/.proxybase/webload.db)
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
+        /// Disable automatic browser opening
+        #[arg(long)]
+        no_open: bool,
+        /// Automatically start seller relay upon web server launch
+        #[arg(long)]
+        start_seller: bool,
     },
     /// Buyer operations
     Buyer {
@@ -178,6 +200,27 @@ enum SellerCmd {
     },
     /// Install seller as a system service (launchd/systemd) — survives reboots
     Install,
+    /// Launch embedded bulk proxy management web UI
+    Webload {
+        /// Initial proxy file to import
+        #[arg(short, long)]
+        file: Option<std::path::PathBuf>,
+        /// Web UI listening port (default: 8787)
+        #[arg(short, long, default_value = "8787")]
+        port: u16,
+        /// Bind interface (default: 127.0.0.1)
+        #[arg(short, long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Custom SQLite database path (default: ~/.proxybase/webload.db)
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
+        /// Disable automatic browser opening
+        #[arg(long)]
+        no_open: bool,
+        /// Automatically start seller relay upon web server launch
+        #[arg(long)]
+        start_seller: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -237,17 +280,17 @@ enum DepositCmd {
 
 /// Upstream SOCKS5 proxy for resell.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct UpstreamProxy {
-    address: String,
+pub struct UpstreamProxy {
+    pub address: String,
     #[serde(default)]
-    username: Option<String>,
+    pub username: Option<String>,
     #[serde(default)]
-    password: Option<String>,
+    pub password: Option<String>,
     /// Parsed from --upstream-user (e.g. "type_residential" → "residential") or query parameters.
-    country: Option<String>,
-    proxy_category: Option<String>,
+    pub country: Option<String>,
+    pub proxy_category: Option<String>,
     #[serde(default)]
-    label: Option<String>,
+    pub label: Option<String>,
 }
 
 /// Parse country and proxy_category from an upstream username.
@@ -2112,6 +2155,27 @@ async fn main() -> Result<()> {
         Commands::Seller { cmd } => {
             // Standalone inspection / diagnostic / daemon commands (no auth required)
             match &cmd {
+                SellerCmd::Webload {
+                    file,
+                    port,
+                    bind,
+                    db,
+                    no_open,
+                    start_seller,
+                } => {
+                    let db_path = db.clone().unwrap_or_else(|| data_dir().join("webload.db"));
+                    let opts = webload::WebloadOptions {
+                        bind: bind.clone(),
+                        port: *port,
+                        db_path,
+                        initial_file: file.clone(),
+                        no_open: *no_open,
+                        start_seller: *start_seller,
+                        backend_url: cli.backend.clone(),
+                    };
+                    webload::run_webload_server(opts).await?;
+                    return Ok(());
+                }
                 SellerCmd::ParseUpstreams { file, json } => {
                     let report = if file == std::path::Path::new("-") {
                         proxy_parser::parse_proxy_stdin()?
@@ -2516,7 +2580,8 @@ async fn main() -> Result<()> {
                 SellerCmd::Stop
                 | SellerCmd::Install
                 | SellerCmd::ParseUpstreams { .. }
-                | SellerCmd::TestUpstreams { .. } => {
+                | SellerCmd::TestUpstreams { .. }
+                | SellerCmd::Webload { .. } => {
                     // Handled above (before auth check)
                     unreachable!();
                 }
@@ -2894,6 +2959,27 @@ async fn main() -> Result<()> {
         Commands::Health => {
             let health = client.health().await?;
             println!("{}", serde_json::to_string_pretty(&health)?);
+        }
+
+        Commands::Webload {
+            file,
+            port,
+            bind,
+            db,
+            no_open,
+            start_seller,
+        } => {
+            let db_path = db.unwrap_or_else(|| data_dir().join("webload.db"));
+            let opts = webload::WebloadOptions {
+                bind,
+                port,
+                db_path,
+                initial_file: file,
+                no_open,
+                start_seller,
+                backend_url: cli.backend.clone(),
+            };
+            webload::run_webload_server(opts).await?;
         }
 
         Commands::Version => {

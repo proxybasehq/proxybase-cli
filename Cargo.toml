@@ -30,6 +30,15 @@ webpki-roots = "0.26"
 semver = "1"
 sha2 = "0.10"
 libc = "0.2"
+axum = { version = "0.7", features = ["ws", "multipart"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+open = "5"
+tokio-util = "0.7"
+async-stream = "0.3"
 
 [profile.release]
 lto = true
