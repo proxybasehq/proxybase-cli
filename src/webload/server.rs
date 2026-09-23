@@ -13,7 +13,7 @@ use axum::{
 use futures_util::stream::Stream;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +39,7 @@ pub struct AppState {
     pub backend_url: String,
     pub auth_user: String,
     pub auth_pass: String,
-    pub auth_tokens: Arc<Mutex<HashSet<String>>>,
+    pub auth_tokens: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 /// Build Axum Router with all API endpoints and embedded static assets.
@@ -60,8 +60,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/stats", get(handle_get_stats))
         .route("/api/seller/toggle", post(handle_toggle_seller))
         .route("/api/events", get(handle_sse_events))
-        // Static assets
+        // Static assets & favicon
         .route("/", get(handle_index))
+        .route("/favicon.ico", get(handle_favicon))
+        .route("/favicon.svg", get(handle_favicon))
         .route("/assets/*path", get(handle_static_asset))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024)) // 500 MB limit for massive proxy uploads
@@ -100,6 +102,18 @@ async fn handle_static_asset(AxumPath(path): AxumPath<String>) -> impl IntoRespo
     }
 }
 
+async fn handle_favicon() -> impl IntoResponse {
+    match WebAssets::get("favicon.svg") {
+        Some(content) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, "image/svg+xml".parse().unwrap());
+            headers.insert(header::CACHE_CONTROL, "public, max-age=86400".parse().unwrap());
+            (StatusCode::OK, headers, content.data).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Favicon not found").into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Authentication Handlers & Middleware
 // ---------------------------------------------------------------------------
@@ -114,6 +128,7 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub token: String,
     pub username: String,
+    pub expires_in_seconds: u64,
 }
 
 async fn handle_login(
@@ -122,11 +137,16 @@ async fn handle_login(
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<serde_json::Value>)> {
     if payload.username == state.auth_user && payload.password == state.auth_pass {
         let token = format!("sess_{}", uuid::Uuid::new_v4().simple());
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(3600);
         let mut tokens = state.auth_tokens.lock().await;
-        tokens.insert(token.clone());
+        // Clean expired tokens
+        let now = std::time::Instant::now();
+        tokens.retain(|_, exp| *exp > now);
+        tokens.insert(token.clone(), expiry);
         Ok(Json(LoginResponse {
             token,
             username: state.auth_user,
+            expires_in_seconds: 3600,
         }))
     } else {
         Err((
@@ -138,10 +158,28 @@ async fn handle_login(
 
 async fn handle_auth_status(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let mut remaining = 3600u64;
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                let tokens = state.auth_tokens.lock().await;
+                if let Some(exp) = tokens.get(token.trim()) {
+                    let now = std::time::Instant::now();
+                    if *exp > now {
+                        remaining = (*exp - now).as_secs();
+                    } else {
+                        remaining = 0;
+                    }
+                }
+            }
+        }
+    }
     (StatusCode::OK, Json(serde_json::json!({
         "authenticated": true,
         "username": state.auth_user,
+        "expires_in_seconds": remaining,
     })))
 }
 
@@ -166,8 +204,14 @@ async fn auth_middleware(
     next: Next,
 ) -> axum::response::Response {
     let path = req.uri().path();
-    // Allow index, static assets, and login endpoint without auth
-    if path == "/" || path.starts_with("/assets/") || path == "/api/auth/login" {
+    // Allow index, static assets, favicon, and login endpoint without auth
+    if path == "/"
+        || path.starts_with("/assets/")
+        || path == "/favicon.ico"
+        || path == "/favicon.svg"
+        || path == "/logo.svg"
+        || path == "/api/auth/login"
+    {
         return next.run(req).await;
     }
 
@@ -196,8 +240,13 @@ async fn auth_middleware(
     }
 
     if let Some(ref t) = token {
-        let tokens = state.auth_tokens.lock().await;
-        if tokens.contains(t) {
+        let is_valid = {
+            let mut tokens = state.auth_tokens.lock().await;
+            let now = std::time::Instant::now();
+            tokens.retain(|_, exp| *exp > now);
+            tokens.get(t).map(|exp| *exp > now).unwrap_or(false)
+        };
+        if is_valid {
             return next.run(req).await;
         }
     }
@@ -455,14 +504,32 @@ async fn handle_cancel_job(
     }
 }
 
+#[derive(Serialize)]
+pub struct WebloadStatsResponse {
+    #[serde(flatten)]
+    pub db_stats: AggregateStats,
+    pub is_relay_running: bool,
+    pub active_streams: u32,
+    pub total_bytes_relayed: u64,
+}
+
 async fn handle_get_stats(
     State(state): State<AppState>,
-) -> Result<Json<AggregateStats>, (StatusCode, String)> {
-    state
+) -> Result<Json<WebloadStatsResponse>, (StatusCode, String)> {
+    let db_stats = state
         .db
         .get_aggregate_stats()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let is_relay_running = state.route_table.is_running();
+    let telem = state.route_table.get_telemetry().await;
+
+    Ok(Json(WebloadStatsResponse {
+        db_stats,
+        is_relay_running,
+        active_streams: telem.active_streams,
+        total_bytes_relayed: telem.total_bytes_relayed,
+    }))
 }
 
 #[derive(Serialize)]
@@ -577,8 +644,11 @@ mod tests {
             progress_tx.clone(),
         ));
         let active_cancellations = Arc::new(Mutex::new(HashMap::new()));
-        let mut tokens = HashSet::new();
-        tokens.insert("test_valid_token".to_string());
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            "test_valid_token".to_string(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        );
         let auth_tokens = Arc::new(Mutex::new(tokens));
 
         let state = AppState {

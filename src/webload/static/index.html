@@ -4,19 +4,26 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ProxyBase Webload — Bulk Upstream Proxy Manager</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
   <link rel="stylesheet" href="/assets/app.css?v=2026">
+  <script>
+    // Prevent login modal flash if a valid, unexpired session exists in localStorage
+    try {
+      var tok = localStorage.getItem('webload_token');
+      var exp = parseInt(localStorage.getItem('webload_expires_at') || '0', 10);
+      if (tok && exp > Date.now()) {
+        document.documentElement.classList.add('has-active-session');
+      }
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <!-- Operator Authentication Gateway Modal -->
   <div id="login-screen" class="login-overlay">
     <div class="login-card">
       <div class="login-header">
-        <div class="login-shield-icon">
-          <svg viewBox="0 0 24 24" width="32" height="32" stroke="currentColor" stroke-width="2" fill="none">
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-            <path d="M12 8v4"/>
-            <circle cx="12" cy="15" r="1"/>
-          </svg>
+        <div class="login-brand-logo">
+          <img src="/assets/logo.svg" alt="ProxyBase" width="56" height="56" class="brand-logo-img">
         </div>
         <h2 class="login-title">ProxyBase Webload</h2>
         <div class="login-subtitle">Operator Authentication Gateway</div>
@@ -90,9 +97,7 @@
       <div class="header-left">
         <div class="brand">
           <div class="brand-logo">
-            <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none">
-              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-            </svg>
+            <img src="/assets/logo.svg" alt="ProxyBase" width="28" height="28" class="brand-logo-img">
           </div>
           <div class="brand-info">
             <span class="brand-name">ProxyBase <span class="brand-highlight">Webload</span></span>

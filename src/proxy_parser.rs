@@ -632,19 +632,93 @@ fn percent_decode(s: &str) -> String {
         .unwrap_or_else(|| s.to_string())
 }
 
+fn normalize_category(cat: &str) -> String {
+    let lower = cat.to_lowercase();
+    if lower.contains("residential") || lower == "res" {
+        "residential".to_string()
+    } else if lower.contains("datacenter") || lower == "dc" {
+        "datacenter".to_string()
+    } else if lower.contains("mobile") {
+        "mobile".to_string()
+    } else {
+        lower
+    }
+}
+
 /// Parse country and proxy_category from an upstream username.
-/// Format: `user_2930d5,type_residential,country_US,session_usresidential`
+/// Supports both:
+/// - Comma/semicolon delimited: `user_2930d5,type_residential,country_US,session_usresidential`
+/// - Hyphen/colon/equals key-value pairs: `mupbbutugn_105989-package-ipv4residential-country-US-session-1010001-time-3600s`
 /// Extracts: country="US", proxy_category="residential"
 pub fn parse_upstream_metadata(username: &str) -> (Option<String>, Option<String>) {
     let mut country = None;
     let mut category = None;
-    for part in username.split(',') {
-        if let Some(c) = part.strip_prefix("country_") {
-            country = Some(c.to_uppercase());
-        } else if let Some(net) = part.strip_prefix("type_") {
-            category = Some(net.to_lowercase());
+
+    // Split on outer delimiters: comma, semicolon, ampersand
+    for chunk in username.split(|c| c == ',' || c == ';' || c == '&') {
+        let subparts: Vec<&str> = chunk.split('-').collect();
+        for i in 0..subparts.len() {
+            let part = subparts[i];
+            let part_lower = part.to_lowercase();
+
+            // Direct key-value match within subpart, e.g. "country_US", "country=US", "country:US"
+            if let Some(c) = part.strip_prefix("country_")
+                .or_else(|| part.strip_prefix("country="))
+                .or_else(|| part.strip_prefix("country:"))
+                .or_else(|| part.strip_prefix("cc_"))
+                .or_else(|| part.strip_prefix("cc="))
+                .or_else(|| part.strip_prefix("cc:"))
+                .or_else(|| part.strip_prefix("geo_"))
+                .or_else(|| part.strip_prefix("geo="))
+                .or_else(|| part.strip_prefix("geo:"))
+            {
+                let clean = c.trim();
+                if clean.len() == 2 && clean.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                    country = Some(clean.to_uppercase());
+                }
+            } else if let Some(cat) = part.strip_prefix("type_")
+                .or_else(|| part.strip_prefix("type="))
+                .or_else(|| part.strip_prefix("type:"))
+                .or_else(|| part.strip_prefix("package_"))
+                .or_else(|| part.strip_prefix("package="))
+                .or_else(|| part.strip_prefix("package:"))
+                .or_else(|| part.strip_prefix("category_"))
+                .or_else(|| part.strip_prefix("category="))
+                .or_else(|| part.strip_prefix("category:"))
+                .or_else(|| part.strip_prefix("net_"))
+                .or_else(|| part.strip_prefix("net="))
+                .or_else(|| part.strip_prefix("net:"))
+                .or_else(|| part.strip_prefix("zone_"))
+                .or_else(|| part.strip_prefix("zone="))
+                .or_else(|| part.strip_prefix("zone:"))
+            {
+                let clean = cat.trim();
+                if !clean.is_empty() {
+                    category = Some(normalize_category(clean));
+                }
+            }
+
+            // Key in subparts[i] followed by value in subparts[i+1], e.g.
+            // subparts = [..., "country", "US", ...], [..., "package", "ipv4residential", ...]
+            if i + 1 < subparts.len() {
+                let next_val = subparts[i + 1].trim();
+                match part_lower.as_str() {
+                    "country" | "cc" | "geo" | "region" => {
+                        if next_val.len() == 2 && next_val.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                            country = Some(next_val.to_uppercase());
+                        }
+                    }
+                    "package" | "type" | "category" | "net" | "zone" => {
+                        if !next_val.is_empty() {
+                            category = Some(normalize_category(next_val));
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
+
     (country, category)
 }
 
@@ -842,4 +916,21 @@ mod tests {
         assert_eq!(p.proxy_category.as_deref(), Some("residential"));
         assert_eq!(p.label.as_deref(), Some("Frankfurt-Node"));
     }
+
+    #[test]
+    fn test_hyphenated_provider_metadata() {
+        let user = "mupbbutugn_105989-package-ipv4residential-country-US-session-1010001-time-3600s";
+        let (country, category) = parse_upstream_metadata(user);
+        assert_eq!(country.as_deref(), Some("US"));
+        assert_eq!(category.as_deref(), Some("residential"));
+
+        let line = format!("pb.zwww.eu.org:31001:{}:eC15rSOhmmMSQ", user);
+        let p = parse_proxy_line(&line).unwrap().expect("Should parse full line");
+        assert_eq!(p.address, "pb.zwww.eu.org:31001");
+        assert_eq!(p.country.as_deref(), Some("US"));
+        assert_eq!(p.proxy_category.as_deref(), Some("residential"));
+        assert_eq!(p.username.as_deref(), Some(user));
+        assert_eq!(p.password.as_deref(), Some("eC15rSOhmmMSQ"));
+    }
 }
+

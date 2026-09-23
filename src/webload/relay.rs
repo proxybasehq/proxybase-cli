@@ -28,6 +28,7 @@ pub struct ActiveRouteTable {
     streams: Arc<RwLock<HashMap<String, (String, CancellationToken)>>>,
     /// Global seller relay running flag
     is_running: Arc<tokio::sync::watch::Sender<bool>>,
+    routes_changed: Arc<tokio::sync::Notify>,
     /// Telemetry counters
     active_streams_count: Arc<AtomicU32>,
     total_streams_count: Arc<AtomicU64>,
@@ -43,6 +44,7 @@ impl ActiveRouteTable {
             active_paths: Arc::new(RwLock::new(HashSet::new())),
             streams: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(tx),
+            routes_changed: Arc::new(tokio::sync::Notify::new()),
             active_streams_count: Arc::new(AtomicU32::new(0)),
             total_streams_count: Arc::new(AtomicU64::new(0)),
             total_bytes_count: Arc::new(AtomicU64::new(0)),
@@ -55,22 +57,44 @@ impl ActiveRouteTable {
         self.is_running.subscribe()
     }
 
+    /// Check if the seller relay is running.
+    pub fn is_running(&self) -> bool {
+        *self.is_running.subscribe().borrow()
+    }
+
+    /// Access the routes changed notification handle.
+    pub fn routes_changed_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.routes_changed.clone()
+    }
+
     /// Set running status
     pub fn set_running(&self, running: bool) {
         let _ = self.is_running.send(running);
     }
 
+    /// Returns all active paths as (path_id, Some(UpstreamProxy)) tuples for seller tunnel registration.
+    pub async fn get_all_active_paths(&self) -> Vec<(String, Option<UpstreamProxy>)> {
+        let routes = self.routes.read().await;
+        routes
+            .iter()
+            .map(|(pid, p)| (pid.clone(), Some((**p).clone())))
+            .collect()
+    }
+
     /// Bulk initialize the hot route table from active database records.
     pub async fn populate(&self, entries: Vec<(String, UpstreamProxy)>) {
-        let mut routes = self.routes.write().await;
-        let mut active = self.active_paths.write().await;
-        routes.clear();
-        active.clear();
+        {
+            let mut routes = self.routes.write().await;
+            let mut active = self.active_paths.write().await;
+            routes.clear();
+            active.clear();
 
-        for (path_id, proxy) in entries {
-            routes.insert(path_id.clone(), Arc::new(proxy));
-            active.insert(path_id);
+            for (path_id, proxy) in entries {
+                routes.insert(path_id.clone(), Arc::new(proxy));
+                active.insert(path_id);
+            }
         }
+        self.routes_changed.notify_waiters();
     }
 
     /// Activate or resume an upstream proxy.

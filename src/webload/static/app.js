@@ -5,6 +5,30 @@
 (() => {
   'use strict';
 
+  // Session & Local Storage Management (1-Hour Session Timeout)
+  const savedToken = localStorage.getItem('webload_token') || '';
+  const savedUsername = localStorage.getItem('webload_username') || '';
+  const savedExpiresAt = parseInt(localStorage.getItem('webload_expires_at') || '0', 10);
+  const isSessionFresh = savedToken && savedExpiresAt > Date.now();
+
+  let sessionTimeoutTimer = null;
+
+  function scheduleSessionTimeout(expiresAt) {
+    if (sessionTimeoutTimer) {
+      clearTimeout(sessionTimeoutTimer);
+      sessionTimeoutTimer = null;
+    }
+    const remainingMs = expiresAt - Date.now();
+    if (remainingMs <= 0) {
+      showLoginScreen('Session timed out after 1 hour. Please log in again.');
+      return;
+    }
+    sessionTimeoutTimer = setTimeout(() => {
+      showToast('Session timed out after 1 hour. Logging out...', 'warning');
+      handleLogout();
+    }, remainingMs);
+  }
+
   // Application State
   const state = {
     page: 1,
@@ -23,8 +47,9 @@
     isRelayRunning: false,
     uploadedFile: null,
     ingestMode: 'local',
-    token: sessionStorage.getItem('webload_token') || '',
-    username: sessionStorage.getItem('webload_username') || '',
+    token: isSessionFresh ? savedToken : '',
+    username: isSessionFresh ? savedUsername : '',
+    expiresAt: isSessionFresh ? savedExpiresAt : 0,
     eventSource: null,
   };
 
@@ -138,6 +163,7 @@
 
   // Dashboard & Authentication State Management
   function enterDashboard() {
+    document.documentElement.classList.add('has-active-session');
     els.loginScreen.classList.add('hidden');
     els.headerUsername.textContent = state.username || 'admin';
     els.headerUserPill.classList.remove('hidden');
@@ -147,14 +173,21 @@
   }
 
   function showLoginScreen(errorMsg = '') {
+    if (sessionTimeoutTimer) {
+      clearTimeout(sessionTimeoutTimer);
+      sessionTimeoutTimer = null;
+    }
     if (state.eventSource) {
       state.eventSource.close();
       state.eventSource = null;
     }
     state.token = '';
     state.username = '';
-    sessionStorage.removeItem('webload_token');
-    sessionStorage.removeItem('webload_username');
+    state.expiresAt = 0;
+    localStorage.removeItem('webload_token');
+    localStorage.removeItem('webload_username');
+    localStorage.removeItem('webload_expires_at');
+    document.documentElement.classList.remove('has-active-session');
     els.headerUserPill.classList.add('hidden');
     els.loginScreen.classList.remove('hidden');
     if (errorMsg) {
@@ -356,10 +389,22 @@
       if (!res.ok) return;
       const data = await res.json();
 
-      els.statTotal.textContent = formatNumber(data.total_proxies);
-      els.statActive.textContent = formatNumber(data.active_proxies);
-      els.statPaused.textContent = formatNumber(data.paused_proxies);
-      els.statError.textContent = formatNumber(data.error_proxies);
+      if (els.statTotal) els.statTotal.textContent = formatNumber(data.total_proxies);
+      if (els.statActive) els.statActive.textContent = formatNumber(data.active_proxies);
+      if (els.statPaused) els.statPaused.textContent = formatNumber(data.paused_proxies);
+      if (els.statError) els.statError.textContent = formatNumber(data.error_proxies);
+
+      if (els.statStreams && data.active_streams !== undefined) {
+        els.statStreams.textContent = formatNumber(data.active_streams);
+      }
+      if (els.statThroughput && data.total_bytes_relayed !== undefined) {
+        els.statThroughput.textContent = formatBytes(data.total_bytes_relayed);
+      }
+
+      if (data.is_relay_running !== undefined) {
+        state.isRelayRunning = !!data.is_relay_running;
+        updateRelayUi();
+      }
 
       // Populate countries dropdown if options only has default
       if (els.countrySelect.options.length <= 2 && data.top_countries) {
@@ -376,6 +421,8 @@
       console.warn('Stats fetch error:', e);
     }
   }
+
+  const fetchStats = updateStats;
 
   // Bulk Bar Logic
   function updateBulkBar() {
@@ -925,9 +972,15 @@
       const data = await res.json();
       state.token = data.token;
       state.username = data.username || username;
-      sessionStorage.setItem('webload_token', data.token);
-      sessionStorage.setItem('webload_username', state.username);
+      const ttlSecs = data.expires_in_seconds || 3600;
+      const expiresAt = Date.now() + (ttlSecs * 1000);
+      state.expiresAt = expiresAt;
 
+      localStorage.setItem('webload_token', data.token);
+      localStorage.setItem('webload_username', state.username);
+      localStorage.setItem('webload_expires_at', expiresAt.toString());
+
+      scheduleSessionTimeout(expiresAt);
       showToast(`Welcome back, ${state.username}!`, 'success');
       enterDashboard();
     } catch (err) {
@@ -953,20 +1006,38 @@
   document.addEventListener('DOMContentLoaded', async () => {
     initEvents();
 
-    if (state.token) {
+    const savedToken = localStorage.getItem('webload_token');
+    const savedExpiresAt = parseInt(localStorage.getItem('webload_expires_at') || '0', 10);
+    const now = Date.now();
+
+    if (savedToken && savedExpiresAt > now) {
+      state.token = savedToken;
+      state.username = localStorage.getItem('webload_username') || 'admin';
+      state.expiresAt = savedExpiresAt;
+      document.documentElement.classList.add('has-active-session');
+      els.loginScreen.classList.add('hidden');
+
       try {
         const res = await fetch('/api/auth/status', {
           headers: { 'Authorization': `Bearer ${state.token}` }
         });
         if (res.ok) {
           const data = await res.json();
-          state.username = data.username || 'admin';
+          state.username = data.username || state.username;
+          const remainingSecs = data.expires_in_seconds || Math.max(1, Math.floor((savedExpiresAt - Date.now()) / 1000));
+          const effectiveExpiresAt = Date.now() + (remainingSecs * 1000);
+          state.expiresAt = effectiveExpiresAt;
+          localStorage.setItem('webload_expires_at', effectiveExpiresAt.toString());
+          scheduleSessionTimeout(effectiveExpiresAt);
           enterDashboard();
           return;
         }
       } catch (err) {
         console.warn('Session verification error:', err);
       }
+    } else if (savedToken && savedExpiresAt <= now) {
+      showLoginScreen('Your session timed out after 1 hour. Please log in again.');
+      return;
     }
 
     showLoginScreen();

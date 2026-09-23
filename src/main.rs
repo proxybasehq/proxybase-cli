@@ -625,7 +625,7 @@ async fn run_seller(backend_url: &str, proxies: &[UpstreamProxy], include_direct
             let token = token.clone();
             let url = base_url.clone();
             handles.push(tokio::spawn(async move {
-                run_multiplexed_tunnel_loop(&url, token, &tunnel_id, shard).await;
+                run_multiplexed_tunnel_loop(&url, token, &tunnel_id, shard, None, None).await;
             }));
             // Stagger tunnel connections slightly
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
@@ -728,14 +728,14 @@ enum BridgeCmd {
 // Backend API client
 // ---------------------------------------------------------------------------
 
-struct BackendClient {
-    http: reqwest::Client,
-    base_url: String,
-    token: Option<String>,
+pub(crate) struct BackendClient {
+    pub(crate) http: reqwest::Client,
+    pub(crate) base_url: String,
+    pub(crate) token: Option<String>,
 }
 
 impl BackendClient {
-    fn new(base_url: &str) -> Self {
+    pub(crate) fn new(base_url: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -763,7 +763,7 @@ impl BackendClient {
         format!("Bearer {}", self.token.as_deref().unwrap_or(""))
     }
 
-    fn is_authenticated(&self) -> bool {
+    pub(crate) fn is_authenticated(&self) -> bool {
         self.token.is_some()
     }
 
@@ -895,7 +895,7 @@ impl BackendClient {
 
     // --- Seller ---
 
-    async fn register_seller(&self, node_type: &str) -> Result<serde_json::Value> {
+    pub(crate) async fn register_seller(&self, node_type: &str) -> Result<serde_json::Value> {
         let resp = self
             .http
             .post(format!("{}/v2/seller/register", self.base_url))
@@ -1098,6 +1098,8 @@ async fn run_stream_relay(
     relay_tx: &tokio::sync::mpsc::UnboundedSender<Message>,
     mut tcp_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     sid: &str,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    route_table: Option<webload::relay::ActiveRouteTable>,
 ) {
     let sid = sid.to_string();
     // Connect to target — via upstream proxy or directly
@@ -1279,6 +1281,9 @@ async fn run_stream_relay(
         tokio::time::Instant::now() + IDLE_TIMEOUT,
     ));
 
+    let rt_for_tcp = route_table.clone();
+    let rt_for_ws = route_table.clone();
+
     let tcp_to_ws = {
         let deadline = deadline.clone();
         async move {
@@ -1296,6 +1301,9 @@ async fn run_stream_relay(
                     }
                     Ok(n) => {
                         *deadline.lock().unwrap() = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                        if let Some(ref rt) = rt_for_tcp {
+                            rt.record_bytes(n as u64);
+                        }
                         let enc = base64_encode(&buf[..n]);
                         let m = serde_json::json!({"type":"relay_response","session_id":&sid2,"data":enc});
                         if tx2.send(Message::Text(serde_json::to_string(&m).unwrap_or_default())).is_err() {
@@ -1325,6 +1333,9 @@ async fn run_stream_relay(
         async move {
             while let Some(data) = tcp_rx.recv().await {
                 *deadline.lock().unwrap() = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                if let Some(ref rt) = rt_for_ws {
+                    rt.record_bytes(data.len() as u64);
+                }
                 if tokio::io::AsyncWriteExt::write_all(&mut tcp_w, &data).await.is_err() {
                     eprintln!("[RELAY {}] Write failed", sid);
                     let m = serde_json::json!({
@@ -1357,6 +1368,20 @@ async fn run_stream_relay(
     tokio::select! {
         _ = tcp_to_ws => {}
         _ = ws_to_tcp => {}
+        _ = async {
+            if let Some(ref c) = cancel_token {
+                c.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            eprintln!("[RELAY {}] Stream cancelled by operator/route table", sid);
+            let m = serde_json::json!({
+                "type": "relay_close",
+                "session_id": &sid,
+            });
+            let _ = relay_tx.send(Message::Text(serde_json::to_string(&m).unwrap_or_default()));
+        }
         _ = idle_waiter => {
             eprintln!("[RELAY {}] Idle timeout — closing", sid);
             let m = serde_json::json!({
@@ -1609,7 +1634,7 @@ async fn try_single_path_connection(
                                     streams.lock().await.insert(sid.clone(), tcp_tx);
 
                                     let handle = tokio::spawn(async move {
-                                        run_stream_relay(&dest, &tip, tport, up.as_ref(), &tx, tcp_rx, &sid).await;
+                                        run_stream_relay(&dest, &tip, tport, up.as_ref(), &tx, tcp_rx, &sid, None, None).await;
                                         streams.lock().await.remove(&sid);
                                     });
                                     relay_tasks.push(handle);
@@ -1632,12 +1657,16 @@ async fn try_single_path_connection(
 
 /// Multiplexed WebSocket connection loop. Manages one persistent tunnel carrying
 /// multiple virtual paths. Reconnects with exponential backoff.
+/// Multiplexed WebSocket connection loop. Manages one persistent tunnel carrying
+/// multiple virtual paths. Reconnects with exponential backoff.
 /// Falls back to single-path connections if the backend does not ACK multiplexing.
-async fn run_multiplexed_tunnel_loop(
+pub(crate) async fn run_multiplexed_tunnel_loop(
     backend_url: &str,
     token: std::sync::Arc<tokio::sync::Mutex<String>>,
     tunnel_id: &str,
     paths: Vec<(String, Option<UpstreamProxy>)>,
+    route_table: Option<webload::relay::ActiveRouteTable>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) {
     let path_map: std::sync::Arc<std::collections::HashMap<String, Option<UpstreamProxy>>> =
         std::sync::Arc::new(paths.into_iter().collect());
@@ -1645,6 +1674,12 @@ async fn run_multiplexed_tunnel_loop(
     let mut backoff_secs = 1u64;
 
     loop {
+        if let Some(ref c) = cancel_token {
+            if c.is_cancelled() {
+                return;
+            }
+        }
+
         let current_token = token.lock().await.clone();
         let encoded_token: String =
             url::form_urlencoded::byte_serialize(current_token.as_bytes()).collect();
@@ -1666,14 +1701,26 @@ async fn run_multiplexed_tunnel_loop(
             tunnel_id,
             &path_ids,
             path_map.clone(),
+            route_table.clone(),
+            cancel_token.clone(),
         )
         .await
         {
             Ok(()) => {
                 backoff_secs = 1;
                 eprintln!("[{}] Multiplexed tunnel disconnected. Reconnecting...", tunnel_id);
+                if let Some(ref c) = cancel_token {
+                    if c.is_cancelled() {
+                        return;
+                    }
+                }
             }
             Err(e) if e.to_string().contains("AUTH_EXPIRED") || e.to_string().contains("401") => {
+                if let Some(ref c) = cancel_token {
+                    if c.is_cancelled() {
+                        return;
+                    }
+                }
                 eprintln!("[{}] Session token expired. Re-authenticating...", tunnel_id);
                 match re_authenticate_single(backend_url).await {
                     Ok(new_token) => {
@@ -1686,7 +1733,16 @@ async fn run_multiplexed_tunnel_loop(
                             "[{}] Re-auth failed: {:#}. Retrying in {}s...",
                             tunnel_id, auth_err, backoff_secs
                         );
-                        tokio::time::sleep(jittered_backoff(backoff_secs)).await;
+                        tokio::select! {
+                            _ = async {
+                                if let Some(ref c) = cancel_token {
+                                    c.cancelled().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            } => return,
+                            _ = tokio::time::sleep(jittered_backoff(backoff_secs)) => {}
+                        }
                         backoff_secs = (backoff_secs * 2).min(60);
                     }
                 }
@@ -1712,11 +1768,25 @@ async fn run_multiplexed_tunnel_loop(
                 return;
             }
             Err(e) => {
+                if let Some(ref c) = cancel_token {
+                    if c.is_cancelled() {
+                        return;
+                    }
+                }
                 eprintln!(
                     "[{}] Tunnel connection failed: {:#}. Retrying in {}s...",
                     tunnel_id, e, backoff_secs
                 );
-                tokio::time::sleep(jittered_backoff(backoff_secs)).await;
+                tokio::select! {
+                    _ = async {
+                        if let Some(ref c) = cancel_token {
+                            c.cancelled().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => return,
+                    _ = tokio::time::sleep(jittered_backoff(backoff_secs)) => {}
+                }
                 backoff_secs = (backoff_secs * 2).min(60);
             }
         }
@@ -1730,14 +1800,22 @@ async fn try_multiplexed_tunnel_connection(
     tunnel_id: &str,
     path_ids: &[String],
     path_map: std::sync::Arc<std::collections::HashMap<String, Option<UpstreamProxy>>>,
+    route_table: Option<webload::relay::ActiveRouteTable>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
-    let (ws, _resp) = tokio::time::timeout(
-        tokio::time::Duration::from_secs(15),
-        connect_async(ws_url),
-    )
-    .await
-    .context("connect_async timed out after 15s")?
-    .context("Failed to connect WebSocket")?;
+    let (ws, _resp) = tokio::select! {
+        _ = async {
+            if let Some(ref c) = cancel_token {
+                c.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => return Ok(()),
+        res = tokio::time::timeout(tokio::time::Duration::from_secs(15), connect_async(ws_url)) => {
+            res.context("connect_async timed out after 15s")?
+               .context("Failed to connect WebSocket")?
+        }
+    };
 
     let conn_id = uuid::Uuid::new_v4().to_string();
     eprintln!(
@@ -1770,22 +1848,33 @@ async fn try_multiplexed_tunnel_connection(
     let mut ack_received = false;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws_stream.next()).await {
-            Ok(Some(Ok(Message::Text(txt)))) => {
-                if let Ok(p) = serde_json::from_str::<serde_json::Value>(&txt) {
-                    if p.get("type").and_then(|v| v.as_str()) == Some("register_multiplex_ack") {
-                        ack_received = true;
-                        break;
-                    } else if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
-                        anyhow::bail!("AUTH_EXPIRED");
+        tokio::select! {
+            _ = async {
+                if let Some(ref c) = cancel_token {
+                    c.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => return Ok(()),
+            msg = tokio::time::timeout(tokio::time::Duration::from_secs(1), ws_stream.next()) => {
+                match msg {
+                    Ok(Some(Ok(Message::Text(txt)))) => {
+                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&txt) {
+                            if p.get("type").and_then(|v| v.as_str()) == Some("register_multiplex_ack") {
+                                ack_received = true;
+                                break;
+                            } else if p.get("error").and_then(|v| v.as_str()) == Some("invalid_token") {
+                                anyhow::bail!("AUTH_EXPIRED");
+                            }
+                        }
                     }
+                    Ok(Some(Ok(Message::Ping(data)))) => {
+                        let _ = ws_sink.send(Message::Pong(data)).await;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    _ => {}
                 }
             }
-            Ok(Some(Ok(Message::Ping(data)))) => {
-                let _ = ws_sink.send(Message::Pong(data)).await;
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => {}
         }
     }
 
@@ -1816,6 +1905,17 @@ async fn try_multiplexed_tunnel_connection(
 
     loop {
         tokio::select! {
+            _ = async {
+                if let Some(ref c) = cancel_token {
+                    c.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                relay_drain.abort();
+                for h in &relay_tasks { h.abort(); }
+                return Ok(());
+            }
             _ = watchdog.tick() => {
                 relay_drain.abort();
                 for h in &relay_tasks { h.abort(); }
@@ -1877,16 +1977,46 @@ async fn try_multiplexed_tunnel_connection(
                                         let _ = relay_tx.send(Message::Text(serde_json::to_string(&ack).unwrap_or_default()));
                                     }
 
-                                    let upstream_opt = path_map.get(path_id).cloned().flatten();
+                                    let (upstream_opt, stream_cancel) = if let Some(ref rt) = route_table {
+                                        if !rt.is_active(path_id).await {
+                                            let m = serde_json::json!({
+                                                "type": "relay_error",
+                                                "session_id": &sid,
+                                                "error": "Upstream path paused by operator",
+                                            });
+                                            let _ = relay_tx.send(Message::Text(serde_json::to_string(&m).unwrap_or_default()));
+                                            continue;
+                                        }
+                                        let sc = tokio_util::sync::CancellationToken::new();
+                                        rt.register_stream(&sid, path_id, sc.clone()).await;
+                                        (rt.get_upstream(path_id).await.map(|p| (*p).clone()), Some(sc))
+                                    } else {
+                                        (path_map.get(path_id).cloned().flatten(), None)
+                                    };
+
                                     let streams = active.clone();
                                     let tx = relay_tx.clone();
+                                    let rt_clone = route_table.clone();
 
                                     let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                                     streams.lock().await.insert(sid.clone(), tcp_tx);
 
                                     let handle = tokio::spawn(async move {
-                                        run_stream_relay(&dest, &tip, tport, upstream_opt.as_ref(), &tx, tcp_rx, &sid).await;
+                                        run_stream_relay(
+                                            &dest,
+                                            &tip,
+                                            tport,
+                                            upstream_opt.as_ref(),
+                                            &tx,
+                                            tcp_rx,
+                                            &sid,
+                                            stream_cancel,
+                                            rt_clone.clone(),
+                                        ).await;
                                         streams.lock().await.remove(&sid);
+                                        if let Some(ref rt) = rt_clone {
+                                            rt.unregister_stream(&sid).await;
+                                        }
                                     });
                                     relay_tasks.push(handle);
                                 }
@@ -3609,7 +3739,7 @@ mod tests {
 
         // Connect to a non-existent port on localhost without upstream proxy
         let sid = "test_fail_sid";
-        run_stream_relay("127.0.0.1", "127.0.0.1", 1, None, &relay_tx, tcp_rx, sid).await;
+        run_stream_relay("127.0.0.1", "127.0.0.1", 1, None, &relay_tx, tcp_rx, sid, None, None).await;
 
         let msg = relay_rx.recv().await.expect("must receive relay_error");
         match msg {

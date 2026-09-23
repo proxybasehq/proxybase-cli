@@ -201,7 +201,13 @@ impl WebloadDb {
                     path_id, address, host, port, username, password,
                     country, category, label, raw_input, status, created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active', ?11)
-                ON CONFLICT(path_id) DO NOTHING"
+                ON CONFLICT(path_id) DO UPDATE SET
+                    country = COALESCE(excluded.country, proxies.country),
+                    category = COALESCE(excluded.category, proxies.category),
+                    password = COALESCE(excluded.password, proxies.password),
+                    label = COALESCE(excluded.label, proxies.label)
+                WHERE (proxies.country IS NULL AND excluded.country IS NOT NULL)
+                   OR (proxies.category IS NULL AND excluded.category IS NOT NULL)"
             )?;
 
             for p in proxies {

@@ -83,8 +83,9 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
     // Spawn background seller relay supervisor
     let rt_clone = route_table.clone();
     let backend_url_clone = opts.backend_url.clone();
+    let db_clone = db.clone();
     tokio::spawn(async move {
-        run_seller_supervisor(rt_clone, backend_url_clone).await;
+        run_seller_supervisor(rt_clone, backend_url_clone, db_clone).await;
     });
 
     // Resolve or generate operator credentials
@@ -95,7 +96,7 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
     let auth_pass = opts.auth_pass.clone().unwrap_or_else(|| {
         format!("pb_{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
     });
-    let auth_tokens = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let auth_tokens = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     // Build Axum web application
     let state = server::AppState {
@@ -131,7 +132,15 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
     let local_addr = listener.local_addr()?;
     let ui_url = format!("http://{}", local_addr);
 
-    println!("\n╔════════════════════════════════════════════════════════════════════════════╗");
+    println!("\n\x1b[1;36m");
+    println!("   ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗██████╗  █████╗ ███████╗███████╗");
+    println!("   ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝██╔══██╗██╔══██╗██╔════╝██╔════╝");
+    println!("   ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ ██████╔╝███████║███████╗█████╗  ");
+    println!("   ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  ██╔══██╗██╔══██║╚════██║██╔══╝  ");
+    println!("   ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   ██████╔╝██║  ██║███████║███████╗");
+    println!("   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝");
+    println!("                  [ High-Capacity Webload Proxy Engine ]\x1b[0m\n");
+    println!("╔════════════════════════════════════════════════════════════════════════════╗");
     println!("║                    ProxyBase Webload Dashboard Online                      ║");
     println!("╠════════════════════════════════════════════════════════════════════════════╣");
     println!("║ Web UI URL:        {:<56} ║", ui_url);
@@ -139,6 +148,7 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
     println!("║ Password:          {:<56} ║", auth_pass);
     println!("║ Database Path:     {:<56} ║", opts.db_path.display());
     println!("║ Backend Gateway:   {:<56} ║", opts.backend_url);
+    println!("║ Session Expiry:    1 hour (persistent across refresh, auto timeout)        ║");
     println!("║ Press Ctrl+C in this terminal to shut down.                               ║");
     println!("╚════════════════════════════════════════════════════════════════════════════╝\n");
 
@@ -151,21 +161,96 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
 }
 
 /// Background supervisor that starts or pauses the multiplexed seller relay based on route table status.
-async fn run_seller_supervisor(route_table: ActiveRouteTable, backend_url: String) {
+async fn run_seller_supervisor(
+    route_table: ActiveRouteTable,
+    backend_url: String,
+    _db: WebloadDb,
+) {
     let mut is_running_rx = route_table.is_running_watch();
+    let routes_changed = route_table.routes_changed_notifier();
+    let mut current_cancel: Option<CancellationToken> = None;
+    let mut tunnel_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
         let is_running = *is_running_rx.borrow_and_update();
-        if is_running {
-            eprintln!("[webload:seller] Seller relay activated. Connecting to backend {}...", backend_url);
-            // In future runs, seller relay loop communicates through route_table
-        } else {
+        if !is_running {
+            if let Some(cancel) = current_cancel.take() {
+                eprintln!("[webload:seller] Stopping seller relay tunnels...");
+                cancel.cancel();
+            }
+            for t in tunnel_tasks.drain(..) {
+                t.abort();
+            }
             eprintln!("[webload:seller] Seller relay standby (paused).");
+        } else {
+            // Cancel any previously running tasks before re-spawning
+            if let Some(cancel) = current_cancel.take() {
+                cancel.cancel();
+            }
+            for t in tunnel_tasks.drain(..) {
+                t.abort();
+            }
+
+            eprintln!("[webload:seller] Seller relay activated. Connecting to backend {}...", backend_url);
+            let client = crate::BackendClient::new(&backend_url);
+            if !client.is_authenticated() {
+                eprintln!("[webload:seller] Warning: Not authenticated to ProxyBase backend. Run 'proxybase-cli login' to earn seller rewards.");
+            } else if let Err(e) = client.register_seller("standard").await {
+                eprintln!("[webload:seller] Warning: Failed to register seller node: {:#}", e);
+            } else {
+                eprintln!("[webload:seller] Seller node registered successfully with backend.");
+            }
+
+            let paths = route_table.get_all_active_paths().await;
+            if paths.is_empty() {
+                eprintln!("[webload:seller] No active upstream proxies configured to relay. Awaiting proxy load...");
+            } else {
+                let cancel_token = CancellationToken::new();
+                current_cancel = Some(cancel_token.clone());
+
+                let token_str = client.token.clone().unwrap_or_default();
+                let token = Arc::new(tokio::sync::Mutex::new(token_str));
+                let base_url = backend_url.clone();
+
+                let shards = libproxybase::network::seller_protocol::shard_paths(&paths, 16);
+                eprintln!(
+                    "[webload:seller] Sharding {} active proxy path(s) across {} multiplexed persistent tunnel(s)",
+                    paths.len(),
+                    shards.len()
+                );
+
+                for (idx, shard) in shards.into_iter().enumerate() {
+                    let tunnel_id = format!("webload_tunnel_{}", idx);
+                    let t_token = token.clone();
+                    let t_url = base_url.clone();
+                    let rt = route_table.clone();
+                    let ct = cancel_token.clone();
+
+                    tunnel_tasks.push(tokio::spawn(async move {
+                        crate::run_multiplexed_tunnel_loop(&t_url, t_token, &tunnel_id, shard, Some(rt), Some(ct)).await;
+                    }));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+                }
+            }
         }
 
-        if is_running_rx.changed().await.is_err() {
-            break;
+        tokio::select! {
+            res = is_running_rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+            }
+            _ = routes_changed.notified(), if is_running => {
+                eprintln!("[webload:seller] Active routes changed while relay online, refreshing tunnels...");
+            }
         }
+    }
+
+    if let Some(c) = current_cancel {
+        c.cancel();
+    }
+    for t in tunnel_tasks {
+        t.abort();
     }
 }
 
