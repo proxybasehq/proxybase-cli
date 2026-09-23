@@ -1,7 +1,8 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -12,7 +13,7 @@ use axum::{
 use futures_util::stream::Stream;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,11 +37,18 @@ pub struct AppState {
     pub progress_tx: broadcast::Sender<IngestProgressEvent>,
     pub active_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     pub backend_url: String,
+    pub auth_user: String,
+    pub auth_pass: String,
+    pub auth_tokens: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Build Axum Router with all API endpoints and embedded static assets.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        // Auth routes
+        .route("/api/auth/login", post(handle_login))
+        .route("/api/auth/status", get(handle_auth_status))
+        .route("/api/auth/logout", post(handle_logout))
         // API routes
         .route("/api/proxies", get(handle_get_proxies))
         .route("/api/proxies/load", post(handle_load_proxies))
@@ -55,6 +63,8 @@ pub fn build_router(state: AppState) -> Router {
         // Static assets
         .route("/", get(handle_index))
         .route("/assets/*path", get(handle_static_asset))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(DefaultBodyLimit::max(500 * 1024 * 1024)) // 500 MB limit for massive proxy uploads
         .with_state(state)
 }
 
@@ -67,6 +77,8 @@ async fn handle_index() -> impl IntoResponse {
         Some(content) => {
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+            headers.insert(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate".parse().unwrap());
+            headers.insert(header::PRAGMA, "no-cache".parse().unwrap());
             (StatusCode::OK, headers, content.data).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Index page not found").into_response(),
@@ -80,11 +92,122 @@ async fn handle_static_asset(AxumPath(path): AxumPath<String>) -> impl IntoRespo
             let mime = mime_guess::from_path(clean_path).first_or_octet_stream();
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, mime.as_ref().parse().unwrap());
-            headers.insert(header::CACHE_CONTROL, "public, max-age=3600".parse().unwrap());
+            headers.insert(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate".parse().unwrap());
+            headers.insert(header::PRAGMA, "no-cache".parse().unwrap());
             (StatusCode::OK, headers, content.data).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Asset not found").into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Authentication Handlers & Middleware
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    pub token: String,
+    pub username: String,
+}
+
+async fn handle_login(
+    State(state): State<AppState>,
+    Json(payload): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if payload.username == state.auth_user && payload.password == state.auth_pass {
+        let token = format!("sess_{}", uuid::Uuid::new_v4().simple());
+        let mut tokens = state.auth_tokens.lock().await;
+        tokens.insert(token.clone());
+        Ok(Json(LoginResponse {
+            token,
+            username: state.auth_user,
+        }))
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Invalid username or password" })),
+        ))
+    }
+}
+
+async fn handle_auth_status(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({
+        "authenticated": true,
+        "username": state.auth_user,
+    })))
+}
+
+async fn handle_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                let mut tokens = state.auth_tokens.lock().await;
+                tokens.remove(token.trim());
+            }
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "success": true })))
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    // Allow index, static assets, and login endpoint without auth
+    if path == "/" || path.starts_with("/assets/") || path == "/api/auth/login" {
+        return next.run(req).await;
+    }
+
+    // Check token in Authorization header: Bearer <token>
+    let mut token = None;
+    if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(t) = auth_str.strip_prefix("Bearer ") {
+                token = Some(t.trim().to_string());
+            }
+        }
+    }
+
+    // Also allow ?token=<token> query parameter (for EventSource SSE)
+    if token.is_none() {
+        if let Some(query) = req.uri().query() {
+            for param in query.split('&') {
+                if let Some((k, v)) = param.split_once('=') {
+                    if k == "token" {
+                        token = Some(v.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(ref t) = token {
+        let tokens = state.auth_tokens.lock().await;
+        if tokens.contains(t) {
+            return next.run(req).await;
+        }
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Unauthorized. Please authenticate with credentials displayed in terminal."
+        })),
+    ).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +500,11 @@ async fn handle_sse_events(
             tokio::select! {
                 // Ingest progress events
                 Ok(evt) = rx_ingest.recv() => {
-                    if let Ok(json_str) = serde_json::to_string(&evt) {
+                    let mut val = serde_json::to_value(&evt).unwrap_or_default();
+                    if let serde_json::Value::Object(ref mut map) = val {
+                        map.insert("type".to_string(), serde_json::Value::String("ingest_progress".to_string()));
+                    }
+                    if let Ok(json_str) = serde_json::to_string(&val) {
                         yield Ok(Event::default().data(json_str));
                     }
                 }
@@ -433,6 +560,13 @@ mod tests {
         }
     }
 
+    fn auth_req(method: &str, uri: &str) -> axum::http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test_valid_token")
+    }
+
     async fn setup_test_app() -> (Router, WebloadDb, ActiveRouteTable) {
         let db = WebloadDb::memory().unwrap();
         let route_table = ActiveRouteTable::new();
@@ -443,6 +577,9 @@ mod tests {
             progress_tx.clone(),
         ));
         let active_cancellations = Arc::new(Mutex::new(HashMap::new()));
+        let mut tokens = HashSet::new();
+        tokens.insert("test_valid_token".to_string());
+        let auth_tokens = Arc::new(Mutex::new(tokens));
 
         let state = AppState {
             db: db.clone(),
@@ -451,6 +588,9 @@ mod tests {
             progress_tx,
             active_cancellations,
             backend_url: "http://127.0.0.1:8080".to_string(),
+            auth_user: "testadmin".to_string(),
+            auth_pass: "testpass123".to_string(),
+            auth_tokens,
         };
 
         (build_router(state), db, route_table)
@@ -481,6 +621,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_api_auth_login_success() {
+        let (app, _, _) = setup_test_app().await;
+
+        let login_body = serde_json::json!({
+            "username": "testadmin",
+            "password": "testpass123"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("Content-Type", "application/json")
+            .body(Body::from(login_body.to_string()))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["token"].as_str().unwrap().starts_with("sess_"));
+        assert_eq!(json["username"], "testadmin");
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_login_invalid() {
+        let (app, _, _) = setup_test_app().await;
+
+        let login_body = serde_json::json!({
+            "username": "testadmin",
+            "password": "wrong_password"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("Content-Type", "application/json")
+            .body(Body::from(login_body.to_string()))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_middleware_blocks_unauthorized() {
+        let (app, _, _) = setup_test_app().await;
+
+        // Missing token -> 401
+        let req_no_token = Request::builder().uri("/api/proxies").body(Body::empty()).unwrap();
+        let res_no_token = app.clone().oneshot(req_no_token).await.unwrap();
+        assert_eq!(res_no_token.status(), StatusCode::UNAUTHORIZED);
+
+        // Invalid token -> 401
+        let req_invalid = Request::builder()
+            .uri("/api/proxies")
+            .header("Authorization", "Bearer invalid_token_xyz")
+            .body(Body::empty())
+            .unwrap();
+        let res_invalid = app.oneshot(req_invalid).await.unwrap();
+        assert_eq!(res_invalid.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_logout() {
+        let (app, _, _) = setup_test_app().await;
+
+        // 1. Verify access works with valid token
+        let req1 = auth_req("GET", "/api/auth/status").body(Body::empty()).unwrap();
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        // 2. Perform logout
+        let req_logout = auth_req("POST", "/api/auth/logout").body(Body::empty()).unwrap();
+        let res_logout = app.clone().oneshot(req_logout).await.unwrap();
+        assert_eq!(res_logout.status(), StatusCode::OK);
+
+        // 3. Verify access is now rejected
+        let req2 = auth_req("GET", "/api/auth/status").body(Body::empty()).unwrap();
+        let res2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_sse_query_token() {
+        let (app, _, _) = setup_test_app().await;
+
+        // Valid query token
+        let req = Request::builder().uri("/api/events?token=test_valid_token").body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Invalid query token
+        let req_bad = Request::builder().uri("/api/events?token=bad_token").body(Body::empty()).unwrap();
+        let res_bad = app.oneshot(req_bad).await.unwrap();
+        assert_eq!(res_bad.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn test_api_proxies_pagination_and_filter() {
         let (app, db, _) = setup_test_app().await;
 
@@ -494,7 +730,7 @@ mod tests {
         db.insert_batch(&proxies).unwrap();
 
         // 1. Pagination: page 1 with limit 10
-        let req = Request::builder().uri("/api/proxies?page=1&limit=10").body(Body::empty()).unwrap();
+        let req = auth_req("GET", "/api/proxies?page=1&limit=10").body(Body::empty()).unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -504,21 +740,21 @@ mod tests {
         assert_eq!(json["total_pages"], 3);
 
         // 2. Filter by country: US
-        let req_us = Request::builder().uri("/api/proxies?country=US&limit=50").body(Body::empty()).unwrap();
+        let req_us = auth_req("GET", "/api/proxies?country=US&limit=50").body(Body::empty()).unwrap();
         let res_us = app.clone().oneshot(req_us).await.unwrap();
         let body_us = axum::body::to_bytes(res_us.into_body(), usize::MAX).await.unwrap();
         let json_us: serde_json::Value = serde_json::from_slice(&body_us).unwrap();
         assert_eq!(json_us["filtered"], 10);
 
         // 3. Filter by Worldwide (null country)
-        let req_ww = Request::builder().uri("/api/proxies?country=WW&limit=50").body(Body::empty()).unwrap();
+        let req_ww = auth_req("GET", "/api/proxies?country=WW&limit=50").body(Body::empty()).unwrap();
         let res_ww = app.clone().oneshot(req_ww).await.unwrap();
         let body_ww = axum::body::to_bytes(res_ww.into_body(), usize::MAX).await.unwrap();
         let json_ww: serde_json::Value = serde_json::from_slice(&body_ww).unwrap();
         assert_eq!(json_ww["filtered"], 10);
 
         // 4. Search query
-        let req_search = Request::builder().uri("/api/proxies?search=10.0.0.15").body(Body::empty()).unwrap();
+        let req_search = auth_req("GET", "/api/proxies?search=10.0.0.15").body(Body::empty()).unwrap();
         let res_search = app.oneshot(req_search).await.unwrap();
         let body_search = axum::body::to_bytes(res_search.into_body(), usize::MAX).await.unwrap();
         let json_search: serde_json::Value = serde_json::from_slice(&body_search).unwrap();
@@ -544,9 +780,7 @@ mod tests {
         let path1 = page.items[0].path_id.clone();
 
         // 1. Toggle proxy 1 to paused
-        let req_toggle = Request::builder()
-            .method("POST")
-            .uri(format!("/api/proxies/{}/toggle", id1))
+        let req_toggle = auth_req("POST", &format!("/api/proxies/{}/toggle", id1))
             .body(Body::empty())
             .unwrap();
         let res_toggle = app.clone().oneshot(req_toggle).await.unwrap();
@@ -563,9 +797,7 @@ mod tests {
             "action": "pause",
             "ids": [id2, id3]
         });
-        let req_bulk = Request::builder()
-            .method("POST")
-            .uri("/api/proxies/bulk")
+        let req_bulk = auth_req("POST", "/api/proxies/bulk")
             .header("Content-Type", "application/json")
             .body(Body::from(bulk_body.to_string()))
             .unwrap();
@@ -581,9 +813,7 @@ mod tests {
             "action": "resume",
             "ids": [id1, id2, id3]
         });
-        let req_resume = Request::builder()
-            .method("POST")
-            .uri("/api/proxies/bulk")
+        let req_resume = auth_req("POST", "/api/proxies/bulk")
             .header("Content-Type", "application/json")
             .body(Body::from(bulk_resume_body.to_string()))
             .unwrap();
@@ -592,9 +822,7 @@ mod tests {
         assert!(route_table.is_active(&path1).await);
 
         // 4. Delete proxy 1
-        let req_del = Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/proxies/{}", id1))
+        let req_del = auth_req("DELETE", &format!("/api/proxies/{}", id1))
             .body(Body::empty())
             .unwrap();
         let res_del = app.oneshot(req_del).await.unwrap();
@@ -613,7 +841,7 @@ mod tests {
         db.insert_batch(&proxies).unwrap();
 
         // Stats
-        let req_stats = Request::builder().uri("/api/stats").body(Body::empty()).unwrap();
+        let req_stats = auth_req("GET", "/api/stats").body(Body::empty()).unwrap();
         let res_stats = app.clone().oneshot(req_stats).await.unwrap();
         assert_eq!(res_stats.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res_stats.into_body(), usize::MAX).await.unwrap();
@@ -623,7 +851,7 @@ mod tests {
 
         // Seller toggle
         assert!(!*route_table.is_running_watch().borrow());
-        let req_toggle = Request::builder().method("POST").uri("/api/seller/toggle").body(Body::empty()).unwrap();
+        let req_toggle = auth_req("POST", "/api/seller/toggle").body(Body::empty()).unwrap();
         let res_toggle = app.clone().oneshot(req_toggle).await.unwrap();
         assert_eq!(res_toggle.status(), StatusCode::OK);
         assert!(*route_table.is_running_watch().borrow());
@@ -637,9 +865,7 @@ mod tests {
             "raw_content": "100.64.0.1:1080:user:pass\n100.64.0.2:1080:user:pass # US\n100.64.0.3:1080:user:pass"
         });
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/proxies/load")
+        let req = auth_req("POST", "/api/proxies/load")
             .header("Content-Type", "application/json")
             .body(Body::from(payload.to_string()))
             .unwrap();
@@ -670,9 +896,7 @@ mod tests {
         let (app, _, _) = setup_test_app().await;
 
         // 1. Cancel non-existent job -> 404
-        let req_missing = Request::builder()
-            .method("POST")
-            .uri("/api/jobs/job_unknown/cancel")
+        let req_missing = auth_req("POST", "/api/jobs/job_unknown/cancel")
             .body(Body::empty())
             .unwrap();
         let res_missing = app.clone().oneshot(req_missing).await.unwrap();
@@ -699,9 +923,7 @@ mod tests {
             "ids": ids
         });
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/proxies/bulk")
+        let req = auth_req("POST", "/api/proxies/bulk")
             .header("Content-Type", "application/json")
             .body(Body::from(bulk_body.to_string()))
             .unwrap();
@@ -723,9 +945,7 @@ mod tests {
         let page = db.query_proxies(&ProxyQueryFilter::default()).unwrap();
         let id = page.items[0].id;
 
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/api/proxies/{}/test", id))
+        let req = auth_req("POST", &format!("/api/proxies/{}/test", id))
             .body(Body::empty())
             .unwrap();
 
@@ -743,7 +963,7 @@ mod tests {
     async fn test_api_sse_events_header() {
         let (app, _, _) = setup_test_app().await;
 
-        let req = Request::builder().uri("/api/events").body(Body::empty()).unwrap();
+        let req = auth_req("GET", "/api/events").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let content_type = res.headers().get("content-type").unwrap().to_str().unwrap();
@@ -761,7 +981,7 @@ mod tests {
         db.insert_batch(&proxies).unwrap();
 
         // Sort by host DESC
-        let req_desc = Request::builder().uri("/api/proxies?sort_by=host&sort_dir=desc").body(Body::empty()).unwrap();
+        let req_desc = auth_req("GET", "/api/proxies?sort_by=host&sort_dir=desc").body(Body::empty()).unwrap();
         let res_desc = app.clone().oneshot(req_desc).await.unwrap();
         assert_eq!(res_desc.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res_desc.into_body(), usize::MAX).await.unwrap();
@@ -770,7 +990,7 @@ mod tests {
         assert_eq!(json["items"][1]["host"], "1.1.1.1");
 
         // Sort by host ASC
-        let req_asc = Request::builder().uri("/api/proxies?sort_by=host&sort_dir=asc").body(Body::empty()).unwrap();
+        let req_asc = auth_req("GET", "/api/proxies?sort_by=host&sort_dir=asc").body(Body::empty()).unwrap();
         let res_asc = app.oneshot(req_asc).await.unwrap();
         let body_asc = axum::body::to_bytes(res_asc.into_body(), usize::MAX).await.unwrap();
         let json_asc: serde_json::Value = serde_json::from_slice(&body_asc).unwrap();

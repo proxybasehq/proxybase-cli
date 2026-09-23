@@ -22,10 +22,29 @@
     activeJobId: null,
     isRelayRunning: false,
     uploadedFile: null,
+    ingestMode: 'local',
+    token: sessionStorage.getItem('webload_token') || '',
+    username: sessionStorage.getItem('webload_username') || '',
+    eventSource: null,
   };
 
   // DOM Elements Cache
   const els = {
+    // Auth & Gateway
+    loginScreen: document.getElementById('login-screen'),
+    loginForm: document.getElementById('login-form'),
+    loginUsername: document.getElementById('login-username'),
+    loginPassword: document.getElementById('login-password'),
+    btnLoginSubmit: document.getElementById('btn-login-submit'),
+    loginSubmitSpinner: document.getElementById('login-submit-spinner'),
+    loginSubmitText: document.getElementById('login-submit-text'),
+    loginError: document.getElementById('login-error'),
+    loginErrorText: document.getElementById('login-error-text'),
+    btnTogglePassVisibility: document.getElementById('btn-toggle-pass-visibility'),
+    headerUserPill: document.getElementById('header-user-pill'),
+    headerUsername: document.getElementById('header-username'),
+    btnLogout: document.getElementById('btn-logout'),
+
     // Stats
     statTotal: document.getElementById('stat-total'),
     statActive: document.getElementById('stat-active'),
@@ -99,6 +118,55 @@
     toastContainer: document.getElementById('toast-container'),
   };
 
+  // Authenticated Fetch Wrapper
+  async function apiFetch(url, options = {}) {
+    options.headers = options.headers || {};
+    if (state.token) {
+      if (options.headers instanceof Headers) {
+        options.headers.set('Authorization', `Bearer ${state.token}`);
+      } else {
+        options.headers['Authorization'] = `Bearer ${state.token}`;
+      }
+    }
+    const res = await fetch(url, options);
+    if (res.status === 401 && !url.includes('/api/auth/login')) {
+      showLoginScreen('Session expired or unauthorized. Please authenticate.');
+      throw new Error('Unauthorized');
+    }
+    return res;
+  }
+
+  // Dashboard & Authentication State Management
+  function enterDashboard() {
+    els.loginScreen.classList.add('hidden');
+    els.headerUsername.textContent = state.username || 'admin';
+    els.headerUserPill.classList.remove('hidden');
+    fetchProxies();
+    fetchStats();
+    connectEventSource();
+  }
+
+  function showLoginScreen(errorMsg = '') {
+    if (state.eventSource) {
+      state.eventSource.close();
+      state.eventSource = null;
+    }
+    state.token = '';
+    state.username = '';
+    sessionStorage.removeItem('webload_token');
+    sessionStorage.removeItem('webload_username');
+    els.headerUserPill.classList.add('hidden');
+    els.loginScreen.classList.remove('hidden');
+    if (errorMsg) {
+      els.loginErrorText.textContent = errorMsg;
+      els.loginError.classList.remove('hidden');
+    } else {
+      els.loginError.classList.add('hidden');
+    }
+    els.loginPassword.value = '';
+    setTimeout(() => els.loginPassword.focus(), 50);
+  }
+
   // Helper formatting functions
   function formatBytes(bytes) {
     if (!bytes || bytes === 0) return '0 B';
@@ -155,7 +223,7 @@
         params.append('search', state.search.trim());
       }
 
-      const res = await fetch(`/api/proxies?${params.toString()}`);
+      const res = await apiFetch(`/api/proxies?${params.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       const data = await res.json();
@@ -284,7 +352,7 @@
   // Update Stats & Aggregate Data
   async function updateStats() {
     try {
-      const res = await fetch('/api/stats');
+      const res = await apiFetch('/api/stats');
       if (!res.ok) return;
       const data = await res.json();
 
@@ -323,7 +391,7 @@
   // Toggle Single Proxy Upstream Status
   async function toggleProxy(id) {
     try {
-      const res = await fetch(`/api/proxies/${id}/toggle`, { method: 'POST' });
+      const res = await apiFetch(`/api/proxies/${id}/toggle`, { method: 'POST' });
       if (!res.ok) throw new Error('Toggle failed');
       const data = await res.json();
 
@@ -338,7 +406,7 @@
   async function testProxy(id) {
     try {
       showToast(`Testing proxy handshake...`, 'info');
-      const res = await fetch(`/api/proxies/${id}/test`, { method: 'POST' });
+      const res = await apiFetch(`/api/proxies/${id}/test`, { method: 'POST' });
       if (!res.ok) throw new Error('Test request failed');
       const data = await res.json();
 
@@ -357,7 +425,7 @@
   async function deleteProxy(id) {
     if (!confirm('Are you sure you want to delete this proxy?')) return;
     try {
-      const res = await fetch(`/api/proxies/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/proxies/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Delete failed');
       showToast('Proxy removed from storage', 'success');
       state.selectedIds.delete(id);
@@ -377,7 +445,7 @@
     }
 
     try {
-      const res = await fetch('/api/proxies/bulk', {
+      const res = await apiFetch('/api/proxies/bulk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, ids }),
@@ -397,7 +465,7 @@
   // Toggle Global Seller Relay
   async function toggleSellerRelay() {
     try {
-      const res = await fetch('/api/seller/toggle', { method: 'POST' });
+      const res = await apiFetch('/api/seller/toggle', { method: 'POST' });
       if (!res.ok) throw new Error('Failed to toggle seller relay');
       const data = await res.json();
       state.isRelayRunning = data.is_running;
@@ -422,39 +490,49 @@
 
   // Start File Ingestion
   async function startIngestion() {
-    const isLocal = els.tabLocal.classList.contains('active');
+    // 1. Direct check: Did user choose an upload file?
+    const file = state.uploadedFile || (els.fileUploadInput && els.fileUploadInput.files && els.fileUploadInput.files[0]);
+    const isUploadTab = !els.tabUpload.classList.contains('hidden') || state.ingestMode === 'upload';
+    const filePath = els.inputFilePath ? els.inputFilePath.value.trim() : '';
+
     let body = {};
 
-    if (isLocal) {
-      const filePath = els.inputFilePath.value.trim();
-      if (!filePath) {
-        showToast('Please enter a valid file path on server', 'error');
+    if (file && (isUploadTab || !filePath)) {
+      // User intends to upload file
+      try {
+        els.btnStartLoad.disabled = true;
+        els.btnStartLoad.textContent = 'Reading file...';
+        const text = await file.text();
+        body = { raw_content: text };
+      } catch (err) {
+        showToast('Failed to read file: ' + err.message, 'error');
+        els.btnStartLoad.disabled = false;
+        els.btnStartLoad.textContent = 'Start Streaming Ingestion';
         return;
       }
+    } else if (isUploadTab && !file) {
+      showToast('Please click or drag a .txt proxy file to upload', 'error');
+      return;
+    } else if (filePath) {
       body = { file_path: filePath };
     } else {
-      if (!state.uploadedFile) {
-        showToast('Please select a file to upload', 'error');
-        return;
-      }
-      // For file upload, read as text and send or stream
-      const text = await state.uploadedFile.text();
-      body = { raw_content: text };
+      showToast('Please select a file to upload or enter a server file path', 'error');
+      return;
     }
 
     try {
       els.btnStartLoad.disabled = true;
-      els.btnStartLoad.textContent = 'Starting...';
+      els.btnStartLoad.textContent = 'Starting ingestion...';
 
-      const res = await fetch('/api/proxies/load', {
+      const res = await apiFetch('/api/proxies/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
 
       if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP ${res.status}`);
+        const errText = await res.text().catch(() => '');
+        throw new Error(errText || `HTTP ${res.status}`);
       }
 
       const data = await res.json();
@@ -462,6 +540,24 @@
       showToast('Streaming ingestion started in background', 'success');
       closeModal();
       els.ingestBanner.classList.remove('hidden');
+
+      // Immediate refresh attempt after 600ms (for fast/small files)
+      setTimeout(() => fetchProxies(), 600);
+
+      // Active polling fallback in case SSE message is delayed or dropped
+      if (state.activePollTimer) clearInterval(state.activePollTimer);
+      state.activePollTimer = setInterval(async () => {
+        await fetchProxies();
+      }, 1500);
+
+      // Failsafe: stop active poll timer after 45s
+      setTimeout(() => {
+        if (state.activePollTimer) {
+          clearInterval(state.activePollTimer);
+          state.activePollTimer = null;
+          els.ingestBanner.classList.add('hidden');
+        }
+      }, 45000);
     } catch (e) {
       showToast('Failed to start ingestion: ' + e.message, 'error');
     } finally {
@@ -474,7 +570,7 @@
   async function cancelIngestion() {
     if (!state.activeJobId) return;
     try {
-      await fetch(`/api/jobs/${state.activeJobId}/cancel`, { method: 'POST' });
+      await apiFetch(`/api/jobs/${state.activeJobId}/cancel`, { method: 'POST' });
       showToast('Cancelling ingestion...', 'info');
     } catch (e) {
       showToast('Cancel failed: ' + e.message, 'error');
@@ -483,31 +579,54 @@
 
   // Connect to Real-Time SSE Stream
   function connectEventSource() {
-    const sse = new EventSource('/api/events');
+    if (state.eventSource) {
+      state.eventSource.close();
+      state.eventSource = null;
+    }
+    if (!state.token) return;
+
+    const sse = new EventSource(`/api/events?token=${encodeURIComponent(state.token)}`);
+    state.eventSource = sse;
 
     sse.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
 
         // Ingestion Progress Event
-        if (msg.type === 'ingest_progress') {
+        if (msg.type === 'ingest_progress' || msg.job_id || msg.lines_read !== undefined) {
           els.ingestBanner.classList.remove('hidden');
-          els.ingestProgressBar.style.width = `${msg.progress_percent.toFixed(1)}%`;
-          els.ingestRateText.textContent = `${formatNumber(msg.lines_per_second)} lines/sec`;
-          els.ingestLinesRead.textContent = formatNumber(msg.lines_read);
-          els.ingestValidCount.textContent = formatNumber(msg.valid_count);
-          els.ingestDupCount.textContent = formatNumber(msg.duplicate_count);
-          els.ingestWarnCount.textContent = formatNumber(msg.warning_count);
+          els.ingestProgressBar.style.width = `${(msg.progress_percent || 0).toFixed(1)}%`;
+          els.ingestRateText.textContent = `${formatNumber(msg.lines_per_second || 0)} lines/sec`;
+          els.ingestLinesRead.textContent = formatNumber(msg.lines_read || 0);
+          els.ingestValidCount.textContent = formatNumber(msg.valid_count || 0);
+          els.ingestDupCount.textContent = formatNumber(msg.duplicate_count || 0);
+          els.ingestWarnCount.textContent = formatNumber(msg.warning_count || 0);
 
           if (msg.status === 'completed') {
-            showToast(`Ingestion completed! Added ${formatNumber(msg.valid_count)} proxies.`, 'success');
-            setTimeout(() => els.ingestBanner.classList.add('hidden'), 5000);
+            if (state.activePollTimer) {
+              clearInterval(state.activePollTimer);
+              state.activePollTimer = null;
+            }
+            if (msg.valid_count === 0 && msg.warning_count > 0) {
+              showToast(`Ingestion finished, but 0 valid proxies were parsed (${formatNumber(msg.warning_count)} invalid format lines)`, 'warning');
+            } else {
+              showToast(`Ingestion completed! Added ${formatNumber(msg.valid_count)} proxies.`, 'success');
+            }
+            setTimeout(() => els.ingestBanner.classList.add('hidden'), 3500);
             fetchProxies();
           } else if (msg.status === 'cancelled') {
+            if (state.activePollTimer) {
+              clearInterval(state.activePollTimer);
+              state.activePollTimer = null;
+            }
             showToast('Ingestion cancelled by operator.', 'info');
             setTimeout(() => els.ingestBanner.classList.add('hidden'), 3000);
             fetchProxies();
           } else if (msg.status === 'failed') {
+            if (state.activePollTimer) {
+              clearInterval(state.activePollTimer);
+              state.activePollTimer = null;
+            }
             showToast(`Ingestion error: ${msg.error_message || 'Unknown error'}`, 'error');
             setTimeout(() => els.ingestBanner.classList.add('hidden'), 5000);
           }
@@ -526,18 +645,26 @@
     };
 
     sse.onerror = () => {
-      // Reconnects automatically
+      if (!state.token && state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+      }
     };
   }
 
   // Modal Handlers
   function openModal() {
     els.modalIngest.classList.remove('hidden');
+    const activeTab = document.querySelector('.modal-tab.active');
+    if (activeTab && activeTab.dataset.tab) {
+      state.ingestMode = activeTab.dataset.tab;
+    }
   }
 
   function closeModal() {
     els.modalIngest.classList.add('hidden');
     state.uploadedFile = null;
+    if (els.fileUploadInput) els.fileUploadInput.value = '';
     els.uploadFileName.textContent = '';
     els.uploadFileName.classList.add('hidden');
   }
@@ -699,6 +826,14 @@
       }
     });
 
+    // Auth & Gateway Events
+    els.loginForm.addEventListener('submit', handleLoginSubmit);
+    els.btnLogout.addEventListener('click', handleLogout);
+    els.btnTogglePassVisibility.addEventListener('click', () => {
+      const isPass = els.loginPassword.type === 'password';
+      els.loginPassword.type = isPass ? 'text' : 'password';
+    });
+
     // Ingestion Modal Events
     els.btnOpenIngest.addEventListener('click', openModal);
     els.btnModalClose.addEventListener('click', closeModal);
@@ -712,12 +847,17 @@
         els.modalTabs.forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         const mode = tab.dataset.tab;
+        state.ingestMode = mode;
         if (mode === 'local') {
           els.tabLocal.classList.remove('hidden');
+          els.tabLocal.classList.add('active');
           els.tabUpload.classList.add('hidden');
+          els.tabUpload.classList.remove('active');
         } else {
           els.tabLocal.classList.add('hidden');
+          els.tabLocal.classList.remove('active');
           els.tabUpload.classList.remove('hidden');
+          els.tabUpload.classList.add('active');
         }
       });
     });
@@ -742,15 +882,93 @@
 
     function handleFileSelect(file) {
       state.uploadedFile = file;
+      state.ingestMode = 'upload';
+      els.modalTabs.forEach(t => t.classList.toggle('active', t.dataset.tab === 'upload'));
+      els.tabLocal.classList.add('hidden');
+      els.tabLocal.classList.remove('active');
+      els.tabUpload.classList.remove('hidden');
+      els.tabUpload.classList.add('active');
       els.uploadFileName.textContent = `Selected: ${file.name} (${formatBytes(file.size)})`;
       els.uploadFileName.classList.remove('hidden');
     }
   }
 
+  // Auth Handlers
+  async function handleLoginSubmit(e) {
+    if (e) e.preventDefault();
+    const username = els.loginUsername.value.trim();
+    const password = els.loginPassword.value;
+
+    if (!username || !password) {
+      els.loginErrorText.textContent = 'Please enter both username and password';
+      els.loginError.classList.remove('hidden');
+      return;
+    }
+
+    els.btnLoginSubmit.disabled = true;
+    els.loginSubmitSpinner.classList.remove('hidden');
+    els.loginSubmitText.textContent = 'Authenticating...';
+    els.loginError.classList.add('hidden');
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Invalid credentials');
+      }
+
+      const data = await res.json();
+      state.token = data.token;
+      state.username = data.username || username;
+      sessionStorage.setItem('webload_token', data.token);
+      sessionStorage.setItem('webload_username', state.username);
+
+      showToast(`Welcome back, ${state.username}!`, 'success');
+      enterDashboard();
+    } catch (err) {
+      els.loginErrorText.textContent = err.message || 'Authentication failed';
+      els.loginError.classList.remove('hidden');
+      els.loginPassword.focus();
+    } finally {
+      els.btnLoginSubmit.disabled = false;
+      els.loginSubmitSpinner.classList.add('hidden');
+      els.loginSubmitText.textContent = 'Unlock Dashboard';
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch (_) {}
+    showToast('Logged out of session', 'info');
+    showLoginScreen();
+  }
+
   // Application Bootstrap
-  document.addEventListener('DOMContentLoaded', () => {
+  document.addEventListener('DOMContentLoaded', async () => {
     initEvents();
-    fetchProxies();
-    connectEventSource();
+
+    if (state.token) {
+      try {
+        const res = await fetch('/api/auth/status', {
+          headers: { 'Authorization': `Bearer ${state.token}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          state.username = data.username || 'admin';
+          enterDashboard();
+          return;
+        }
+      } catch (err) {
+        console.warn('Session verification error:', err);
+      }
+    }
+
+    showLoginScreen();
   });
 })();

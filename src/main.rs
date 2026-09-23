@@ -70,6 +70,12 @@ enum Commands {
         /// Automatically start seller relay upon web server launch
         #[arg(long)]
         start_seller: bool,
+        /// Optional username for Web UI authentication (default: admin)
+        #[arg(long)]
+        auth_user: Option<String>,
+        /// Optional password for Web UI authentication (default: auto-generated)
+        #[arg(long)]
+        auth_pass: Option<String>,
     },
     /// Buyer operations
     Buyer {
@@ -220,6 +226,12 @@ enum SellerCmd {
         /// Automatically start seller relay upon web server launch
         #[arg(long)]
         start_seller: bool,
+        /// Optional username for Web UI authentication (default: admin)
+        #[arg(long)]
+        auth_user: Option<String>,
+        /// Optional password for Web UI authentication (default: auto-generated)
+        #[arg(long)]
+        auth_pass: Option<String>,
     },
 }
 
@@ -2162,6 +2174,8 @@ async fn main() -> Result<()> {
                     db,
                     no_open,
                     start_seller,
+                    auth_user,
+                    auth_pass,
                 } => {
                     let db_path = db.clone().unwrap_or_else(|| data_dir().join("webload.db"));
                     let opts = webload::WebloadOptions {
@@ -2172,6 +2186,8 @@ async fn main() -> Result<()> {
                         no_open: *no_open,
                         start_seller: *start_seller,
                         backend_url: cli.backend.clone(),
+                        auth_user: auth_user.clone(),
+                        auth_pass: auth_pass.clone(),
                     };
                     webload::run_webload_server(opts).await?;
                     return Ok(());
@@ -2968,6 +2984,8 @@ async fn main() -> Result<()> {
             db,
             no_open,
             start_seller,
+            auth_user,
+            auth_pass,
         } => {
             let db_path = db.unwrap_or_else(|| data_dir().join("webload.db"));
             let opts = webload::WebloadOptions {
@@ -2978,6 +2996,8 @@ async fn main() -> Result<()> {
                 no_open,
                 start_seller,
                 backend_url: cli.backend.clone(),
+                auth_user,
+                auth_pass,
             };
             webload::run_webload_server(opts).await?;
         }

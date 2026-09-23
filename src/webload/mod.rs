@@ -24,6 +24,8 @@ pub struct WebloadOptions {
     pub no_open: bool,
     pub start_seller: bool,
     pub backend_url: String,
+    pub auth_user: Option<String>,
+    pub auth_pass: Option<String>,
 }
 
 /// Run the embedded webload HTTP server and bulk proxy manager.
@@ -85,6 +87,16 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
         run_seller_supervisor(rt_clone, backend_url_clone).await;
     });
 
+    // Resolve or generate operator credentials
+    let auth_user = opts
+        .auth_user
+        .clone()
+        .unwrap_or_else(|| "admin".to_string());
+    let auth_pass = opts.auth_pass.clone().unwrap_or_else(|| {
+        format!("pb_{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+    });
+    let auth_tokens = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
     // Build Axum web application
     let state = server::AppState {
         db,
@@ -93,6 +105,9 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
         progress_tx,
         active_cancellations,
         backend_url: opts.backend_url.clone(),
+        auth_user: auth_user.clone(),
+        auth_pass: auth_pass.clone(),
+        auth_tokens,
     };
 
     let router = server::build_router(state);
@@ -120,6 +135,8 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
     println!("║                    ProxyBase Webload Dashboard Online                      ║");
     println!("╠════════════════════════════════════════════════════════════════════════════╣");
     println!("║ Web UI URL:        {:<56} ║", ui_url);
+    println!("║ Username:          {:<56} ║", auth_user);
+    println!("║ Password:          {:<56} ║", auth_pass);
     println!("║ Database Path:     {:<56} ║", opts.db_path.display());
     println!("║ Backend Gateway:   {:<56} ║", opts.backend_url);
     println!("║ Press Ctrl+C in this terminal to shut down.                               ║");
