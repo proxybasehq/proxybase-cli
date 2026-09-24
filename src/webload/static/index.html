@@ -135,6 +135,15 @@
       </div>
 
       <div class="header-actions">
+        <button id="btn-open-wallet" class="btn btn-wallet" title="Wallet & Earnings">
+          <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+            <rect x="2" y="4" width="20" height="16" rx="2"/>
+            <path d="M7 15h0M2 10h20"/>
+            <circle cx="16" cy="14" r="1.5"/>
+          </svg>
+          <span>Wallet</span>
+          <span id="header-wallet-badge" class="badge-funds">0 µcr</span>
+        </button>
         <button id="btn-open-ingest" class="btn btn-primary">
           <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -462,6 +471,228 @@
         <div class="modal-footer">
           <button id="btn-modal-cancel" class="btn btn-secondary">Cancel</button>
           <button id="btn-start-load" class="btn btn-primary">Start Streaming Ingestion</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Wallet Information & Payouts Modal -->
+    <div id="modal-wallet" class="modal-overlay hidden">
+      <div class="modal-container modal-lg">
+        <div class="modal-header">
+          <div class="modal-title">
+            <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" stroke-width="2" fill="none">
+              <rect x="2" y="4" width="20" height="16" rx="2"/>
+              <path d="M7 15h0M2 10h20"/>
+              <circle cx="16" cy="14" r="1.5"/>
+            </svg>
+            <h3>Wallet & Funds</h3>
+          </div>
+          <button id="btn-wallet-modal-close" class="modal-close">&times;</button>
+        </div>
+
+        <div class="modal-body">
+          <!-- Wallet Address Bar -->
+          <div class="wallet-address-bar">
+            <div class="wallet-address-meta">
+              <span class="wallet-indicator-dot" id="wallet-status-dot"></span>
+              <span class="wallet-address-label">Connected Wallet:</span>
+              <code id="wallet-address-display" class="wallet-address-code">Loading...</code>
+            </div>
+            <button type="button" id="btn-copy-wallet-address" class="btn-copy-address" title="Copy Wallet Address">
+              <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+              <span id="btn-copy-text">Copy</span>
+            </button>
+          </div>
+
+          <!-- Modal Tabs -->
+          <div class="modal-tabs wallet-tabs">
+            <button type="button" class="modal-tab active" data-wallet-tab="funds">Funds Overview</button>
+            <button type="button" class="modal-tab" data-wallet-tab="withdraw">Request Payout</button>
+            <button type="button" class="modal-tab" data-wallet-tab="history">Payout History</button>
+          </div>
+
+          <!-- Tab 1: Funds Overview -->
+          <div id="wallet-tab-funds" class="wallet-tab-pane active">
+            <div class="funds-grid">
+              <!-- Seller Available (Highlighted) -->
+              <div class="fund-card primary-highlight">
+                <div class="fund-card-header">
+                  <span class="fund-card-title">Seller Available</span>
+                  <span class="fund-badge success">Withdrawal Ready</span>
+                </div>
+                <div class="fund-amount" id="fund-seller-available">0 µcr</div>
+                <div class="fund-subtext" id="fund-seller-available-usd">≈ $0.00 AlphaUSD</div>
+                <div class="fund-card-footer">
+                  <button type="button" id="btn-quick-withdraw" class="btn btn-sm btn-primary">
+                    <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none">
+                      <line x1="12" y1="19" x2="12" y2="5"/>
+                      <polyline points="5 12 12 5 19 12"/>
+                    </svg>
+                    <span>Withdraw Funds</span>
+                  </button>
+                </div>
+              </div>
+
+              <!-- Seller Pending -->
+              <div class="fund-card">
+                <div class="fund-card-header">
+                  <span class="fund-card-title">Seller Pending</span>
+                  <span class="fund-badge">Unsettled</span>
+                </div>
+                <div class="fund-amount" id="fund-seller-pending">0 µcr</div>
+                <div class="fund-subtext" id="fund-seller-pending-usd">≈ $0.00 AlphaUSD</div>
+              </div>
+
+              <!-- Seller Locked in Payout -->
+              <div class="fund-card">
+                <div class="fund-card-header">
+                  <span class="fund-card-title">Seller Payout Locked</span>
+                  <span class="fund-badge warning">In Transit</span>
+                </div>
+                <div class="fund-amount" id="fund-seller-locked">0 µcr</div>
+                <div class="fund-subtext" id="fund-seller-locked-usd">≈ $0.00 AlphaUSD</div>
+              </div>
+
+              <!-- Buyer Spendable -->
+              <div class="fund-card">
+                <div class="fund-card-header">
+                  <span class="fund-card-title">Buyer Spendable</span>
+                  <span class="fund-badge info">Available</span>
+                </div>
+                <div class="fund-amount" id="fund-buyer-spendable">0 µcr</div>
+                <div class="fund-subtext" id="fund-buyer-spendable-usd">≈ $0.00 AlphaUSD</div>
+              </div>
+
+              <!-- Buyer Reserved -->
+              <div class="fund-card">
+                <div class="fund-card-header">
+                  <span class="fund-card-title">Buyer Reserved</span>
+                  <span class="fund-badge">In Sessions</span>
+                </div>
+                <div class="fund-amount" id="fund-buyer-reserved">0 µcr</div>
+                <div class="fund-subtext" id="fund-buyer-reserved-usd">≈ $0.00 AlphaUSD</div>
+              </div>
+
+              <!-- Buyer Spent -->
+              <div class="fund-card">
+                <div class="fund-card-header">
+                  <span class="fund-card-title">Buyer Spent</span>
+                  <span class="fund-badge">Lifetime</span>
+                </div>
+                <div class="fund-amount" id="fund-buyer-spent">0 µcr</div>
+                <div class="fund-subtext" id="fund-buyer-spent-usd">≈ $0.00 AlphaUSD</div>
+              </div>
+            </div>
+
+            <div class="wallet-info-note">
+              <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="16" x2="12" y2="12"/>
+                <line x1="12" y1="8" x2="12.01" y2="8"/>
+              </svg>
+              <span>1 AlphaUSD = 1,000,000 microcredits (µcr). Seller earnings accumulate from proxied relay traffic and can be withdrawn anytime to an Ethereum-style address on Tempo Chain.</span>
+            </div>
+          </div>
+
+          <!-- Tab 2: Request Payout (Withdrawal Section) -->
+          <div id="wallet-tab-withdraw" class="wallet-tab-pane hidden">
+            <div class="withdraw-banner">
+              <div class="withdraw-banner-title">Available for Withdrawal</div>
+              <div class="withdraw-banner-amount" id="withdraw-available-headline">0 µcr (≈ $0.00 AlphaUSD)</div>
+              <p class="withdraw-banner-desc">
+                Payouts are settled directly to an external Ethereum-style wallet address on Tempo Chain.
+              </p>
+            </div>
+
+            <form id="payout-form" onsubmit="return false;" class="payout-form">
+              <!-- Destination Ethereum Address -->
+              <div class="form-group">
+                <div class="label-with-action">
+                  <label for="payout-address" class="form-label">Destination Address (Ethereum / Tempo format):</label>
+                  <button type="button" id="btn-use-own-wallet" class="btn-link">Use Node Wallet</button>
+                </div>
+                <div class="input-with-validation">
+                  <input type="text" id="payout-address" class="form-input font-mono" placeholder="0x71C... (42 hex characters)" autocomplete="off" spellcheck="false" required>
+                  <span id="payout-address-status" class="validation-status-badge hidden"></span>
+                </div>
+                <span class="form-hint" id="payout-address-hint">
+                  Only 42-character Ethereum-style addresses starting with <code>0x</code> are accepted.
+                </span>
+              </div>
+
+              <!-- Amount Input with Presets -->
+              <div class="form-group">
+                <label for="payout-amount" class="form-label">Withdrawal Amount (in microcredits):</label>
+                <div class="amount-input-row">
+                  <input type="number" id="payout-amount" class="form-input" placeholder="e.g. 1000000" min="1000" step="1000" required>
+                  <div class="amount-presets">
+                    <button type="button" class="btn-preset" data-pct="0.25">25%</button>
+                    <button type="button" class="btn-preset" data-pct="0.5">50%</button>
+                    <button type="button" class="btn-preset" data-pct="1.0">Max</button>
+                  </div>
+                </div>
+                <div class="amount-conversion" id="payout-amount-usd">≈ $0.00 AlphaUSD</div>
+              </div>
+
+              <!-- Error & Success Alert Boxes -->
+              <div id="payout-error" class="alert-box alert-danger hidden">
+                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="12" y1="8" x2="12" y2="12"/>
+                  <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                <span id="payout-error-text">Error message</span>
+              </div>
+
+              <div id="payout-success" class="alert-box alert-success hidden">
+                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                  <polyline points="22 4 12 14.01 9 11.01"/>
+                </svg>
+                <div id="payout-success-text">Payout requested successfully!</div>
+              </div>
+
+              <button type="submit" id="btn-submit-payout" class="btn btn-primary btn-block">
+                <span id="payout-submit-spinner" class="spinner hidden"></span>
+                <span id="payout-submit-text">Confirm & Submit Payout Request</span>
+              </button>
+            </form>
+          </div>
+
+          <!-- Tab 3: Payout History -->
+          <div id="wallet-tab-history" class="wallet-tab-pane hidden">
+            <div id="history-loading" class="history-loading hidden">
+              <span class="spinner"></span> Loading payout records...
+            </div>
+            <div id="history-empty" class="history-empty hidden">
+              <svg viewBox="0 0 24 24" width="36" height="36" stroke="currentColor" stroke-width="1.5" fill="none">
+                <circle cx="12" cy="12" r="10"/>
+                <polyline points="12 6 12 12 14 14"/>
+              </svg>
+              <p>No payout requests found for this wallet yet.</p>
+            </div>
+            <div id="history-table-wrapper" class="history-table-wrapper hidden">
+              <table class="history-table">
+                <thead>
+                  <tr>
+                    <th>Created</th>
+                    <th>Amount</th>
+                    <th>Destination</th>
+                    <th>Status</th>
+                    <th>Tx Hash</th>
+                  </tr>
+                </thead>
+                <tbody id="history-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button id="btn-wallet-modal-done" class="btn btn-secondary">Close</button>
         </div>
       </div>
     </div>

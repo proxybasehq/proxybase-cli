@@ -55,6 +55,15 @@
     activeUpstreamPaths: 0,
     activeStreams: 0,
     bytesPerSec: 0,
+    // Wallet & Funds State
+    walletAddress: '',
+    sellerAvailable: 0,
+    sellerPending: 0,
+    sellerPayoutLocked: 0,
+    buyerSpendable: 0,
+    buyerReserved: 0,
+    buyerSpent: 0,
+    activeWalletTab: 'funds',
   };
 
   // DOM Elements Cache
@@ -146,12 +155,60 @@
     btnModalCancel: document.getElementById('btn-modal-cancel'),
     btnStartLoad: document.getElementById('btn-start-load'),
     inputFilePath: document.getElementById('input-file-path'),
-    modalTabs: document.querySelectorAll('.modal-tab'),
+    modalTabs: document.querySelectorAll('#modal-ingest .modal-tab'),
     tabLocal: document.getElementById('tab-local'),
     tabUpload: document.getElementById('tab-upload'),
     dropZone: document.getElementById('drop-zone'),
     fileUploadInput: document.getElementById('file-upload-input'),
     uploadFileName: document.getElementById('upload-file-name'),
+
+    // Wallet Modal & Payouts
+    btnOpenWallet: document.getElementById('btn-open-wallet'),
+    headerWalletBadge: document.getElementById('header-wallet-badge'),
+    modalWallet: document.getElementById('modal-wallet'),
+    btnWalletModalClose: document.getElementById('btn-wallet-modal-close'),
+    btnWalletModalDone: document.getElementById('btn-wallet-modal-done'),
+    walletStatusDot: document.getElementById('wallet-status-dot'),
+    walletAddressDisplay: document.getElementById('wallet-address-display'),
+    btnCopyWalletAddress: document.getElementById('btn-copy-wallet-address'),
+    btnCopyText: document.getElementById('btn-copy-text'),
+    walletTabs: document.querySelectorAll('.wallet-tabs .modal-tab'),
+    walletTabFunds: document.getElementById('wallet-tab-funds'),
+    walletTabWithdraw: document.getElementById('wallet-tab-withdraw'),
+    walletTabHistory: document.getElementById('wallet-tab-history'),
+    fundSellerAvailable: document.getElementById('fund-seller-available'),
+    fundSellerAvailableUsd: document.getElementById('fund-seller-available-usd'),
+    fundSellerPending: document.getElementById('fund-seller-pending'),
+    fundSellerPendingUsd: document.getElementById('fund-seller-pending-usd'),
+    fundSellerLocked: document.getElementById('fund-seller-locked'),
+    fundSellerLockedUsd: document.getElementById('fund-seller-locked-usd'),
+    fundBuyerSpendable: document.getElementById('fund-buyer-spendable'),
+    fundBuyerSpendableUsd: document.getElementById('fund-buyer-spendable-usd'),
+    fundBuyerReserved: document.getElementById('fund-buyer-reserved'),
+    fundBuyerReservedUsd: document.getElementById('fund-buyer-reserved-usd'),
+    fundBuyerSpent: document.getElementById('fund-buyer-spent'),
+    fundBuyerSpentUsd: document.getElementById('fund-buyer-spent-usd'),
+    btnQuickWithdraw: document.getElementById('btn-quick-withdraw'),
+    withdrawAvailableHeadline: document.getElementById('withdraw-available-headline'),
+    payoutForm: document.getElementById('payout-form'),
+    payoutAddress: document.getElementById('payout-address'),
+    payoutAddressStatus: document.getElementById('payout-address-status'),
+    payoutAddressHint: document.getElementById('payout-address-hint'),
+    btnUseOwnWallet: document.getElementById('btn-use-own-wallet'),
+    payoutAmount: document.getElementById('payout-amount'),
+    payoutAmountUsd: document.getElementById('payout-amount-usd'),
+    btnPresets: document.querySelectorAll('.btn-preset'),
+    payoutError: document.getElementById('payout-error'),
+    payoutErrorText: document.getElementById('payout-error-text'),
+    payoutSuccess: document.getElementById('payout-success'),
+    payoutSuccessText: document.getElementById('payout-success-text'),
+    btnSubmitPayout: document.getElementById('btn-submit-payout'),
+    payoutSubmitSpinner: document.getElementById('payout-submit-spinner'),
+    payoutSubmitText: document.getElementById('payout-submit-text'),
+    historyLoading: document.getElementById('history-loading'),
+    historyEmpty: document.getElementById('history-empty'),
+    historyTableWrapper: document.getElementById('history-table-wrapper'),
+    historyTbody: document.getElementById('history-tbody'),
 
     // Toasts
     toastContainer: document.getElementById('toast-container'),
@@ -183,6 +240,7 @@
     els.headerUserPill.classList.remove('hidden');
     fetchProxies();
     fetchStats();
+    fetchWalletInfo();
     connectEventSource();
   }
 
@@ -225,6 +283,19 @@
 
   function formatNumber(num) {
     return (num || 0).toLocaleString();
+  }
+
+  function formatMicrocredits(amount) {
+    return (Number(amount) || 0).toLocaleString() + ' µcr';
+  }
+
+  function microcreditsToUsd(amount) {
+    const usd = ((Number(amount) || 0) / 1000000).toFixed(2);
+    return `≈ $${usd} AlphaUSD`;
+  }
+
+  function isValidEthAddress(addr) {
+    return /^0x[0-9a-fA-F]{40}$/.test(String(addr || '').trim());
   }
 
   function getCountryFlag(cc) {
@@ -436,6 +507,7 @@
           }
         });
       }
+      fetchWalletInfo();
     } catch (e) {
       console.warn('Stats fetch error:', e);
     }
@@ -777,6 +849,280 @@
     els.uploadFileName.classList.add('hidden');
   }
 
+  // ---------------------------------------------------------------------------
+  // Wallet & Payout Operations
+  // ---------------------------------------------------------------------------
+
+  function openWalletModal(tab = 'funds') {
+    if (!els.modalWallet) return;
+    els.modalWallet.classList.remove('hidden');
+    switchWalletTab(tab);
+    fetchWalletInfo();
+  }
+
+  function closeWalletModal() {
+    if (!els.modalWallet) return;
+    els.modalWallet.classList.add('hidden');
+    if (els.payoutError) els.payoutError.classList.add('hidden');
+    if (els.payoutSuccess) els.payoutSuccess.classList.add('hidden');
+  }
+
+  function copyWalletAddress() {
+    if (!state.walletAddress) {
+      showToast('No wallet address available to copy', 'warning');
+      return;
+    }
+    navigator.clipboard.writeText(state.walletAddress).then(() => {
+      if (els.btnCopyText) els.btnCopyText.textContent = 'Copied!';
+      setTimeout(() => {
+        if (els.btnCopyText) els.btnCopyText.textContent = 'Copy';
+      }, 2000);
+      showToast('Wallet address copied to clipboard', 'info');
+    }).catch(() => {
+      showToast('Failed to copy to clipboard', 'error');
+    });
+  }
+
+  function switchWalletTab(tabName) {
+    state.activeWalletTab = tabName;
+    els.walletTabs.forEach(t => {
+      t.classList.toggle('active', t.dataset.walletTab === tabName);
+    });
+
+    if (els.walletTabFunds) {
+      els.walletTabFunds.classList.toggle('hidden', tabName !== 'funds');
+      els.walletTabFunds.classList.toggle('active', tabName === 'funds');
+    }
+    if (els.walletTabWithdraw) {
+      els.walletTabWithdraw.classList.toggle('hidden', tabName !== 'withdraw');
+      els.walletTabWithdraw.classList.toggle('active', tabName === 'withdraw');
+    }
+    if (els.walletTabHistory) {
+      els.walletTabHistory.classList.toggle('hidden', tabName !== 'history');
+      els.walletTabHistory.classList.toggle('active', tabName === 'history');
+    }
+
+    if (tabName === 'history') {
+      fetchPayouts();
+    } else if (tabName === 'withdraw') {
+      if (els.payoutError) els.payoutError.classList.add('hidden');
+      if (els.payoutSuccess) els.payoutSuccess.classList.add('hidden');
+      validatePayoutAddress();
+      if (els.payoutAmount && els.payoutAmountUsd) {
+        els.payoutAmountUsd.textContent = microcreditsToUsd(els.payoutAmount.value || 0);
+      }
+    }
+  }
+
+  function validatePayoutAddress() {
+    if (!els.payoutAddress || !els.payoutAddressStatus) return false;
+    const val = (els.payoutAddress.value || '').trim();
+    if (!val) {
+      els.payoutAddressStatus.className = 'validation-status-badge hidden';
+      els.payoutAddressStatus.textContent = '';
+      return false;
+    }
+    if (isValidEthAddress(val)) {
+      els.payoutAddressStatus.className = 'validation-status-badge valid';
+      els.payoutAddressStatus.textContent = '✓ Valid ETH Address';
+      return true;
+    } else {
+      els.payoutAddressStatus.className = 'validation-status-badge invalid';
+      els.payoutAddressStatus.textContent = '✗ Invalid (0x + 40 hex)';
+      return false;
+    }
+  }
+
+  function setPayoutPreset(pct) {
+    if (!els.payoutAmount || !els.payoutAmountUsd) return;
+    const avail = Math.max(0, state.sellerAvailable || 0);
+    const amount = Math.floor(avail * pct);
+    els.payoutAmount.value = amount > 0 ? amount : '';
+    els.payoutAmountUsd.textContent = microcreditsToUsd(amount);
+  }
+
+  async function fetchWalletInfo() {
+    if (!state.token) return;
+    try {
+      const res = await apiFetch('/api/wallet');
+      if (!res.ok) throw new Error('Failed to fetch wallet status');
+      const data = await res.json();
+
+      state.walletAddress = data.wallet_address || '';
+      state.sellerAvailable = data.seller_available || 0;
+      state.sellerPending = data.seller_pending || 0;
+      state.sellerPayoutLocked = data.seller_payout_locked || 0;
+      state.buyerSpendable = data.buyer_available || 0;
+      state.buyerReserved = data.buyer_reserved || 0;
+      state.buyerSpent = data.buyer_spent || 0;
+
+      // Update Header badge with seller earnings
+      if (els.headerWalletBadge) {
+        els.headerWalletBadge.textContent = formatMicrocredits(state.sellerAvailable);
+      }
+
+      // Update Address Display
+      if (els.walletAddressDisplay) {
+        if (state.walletAddress) {
+          els.walletAddressDisplay.textContent = state.walletAddress;
+          els.walletAddressDisplay.title = state.walletAddress;
+          if (els.walletStatusDot) els.walletStatusDot.className = 'wallet-indicator-dot online';
+        } else {
+          els.walletAddressDisplay.textContent = 'No node wallet detected';
+          if (els.walletStatusDot) els.walletStatusDot.className = 'wallet-indicator-dot offline';
+        }
+      }
+
+      // Update Funds Cards
+      if (els.fundSellerAvailable) {
+        els.fundSellerAvailable.textContent = formatMicrocredits(state.sellerAvailable);
+        els.fundSellerAvailableUsd.textContent = microcreditsToUsd(state.sellerAvailable);
+        els.fundSellerPending.textContent = formatMicrocredits(state.sellerPending);
+        els.fundSellerPendingUsd.textContent = microcreditsToUsd(state.sellerPending);
+        els.fundSellerLocked.textContent = formatMicrocredits(state.sellerPayoutLocked);
+        els.fundSellerLockedUsd.textContent = microcreditsToUsd(state.sellerPayoutLocked);
+        els.fundBuyerSpendable.textContent = formatMicrocredits(state.buyerSpendable);
+        els.fundBuyerSpendableUsd.textContent = microcreditsToUsd(state.buyerSpendable);
+        els.fundBuyerReserved.textContent = formatMicrocredits(state.buyerReserved);
+        els.fundBuyerReservedUsd.textContent = microcreditsToUsd(state.buyerReserved);
+        els.fundBuyerSpent.textContent = formatMicrocredits(state.buyerSpent);
+        els.fundBuyerSpentUsd.textContent = microcreditsToUsd(state.buyerSpent);
+      }
+
+      // Update Withdraw Banner headline
+      if (els.withdrawAvailableHeadline) {
+        els.withdrawAvailableHeadline.textContent = `${formatMicrocredits(state.sellerAvailable)} (${microcreditsToUsd(state.sellerAvailable)})`;
+      }
+    } catch (e) {
+      console.warn('Wallet fetch error:', e);
+    }
+  }
+
+  async function fetchPayouts() {
+    if (!state.token) return;
+    if (els.historyLoading) els.historyLoading.classList.remove('hidden');
+    if (els.historyEmpty) els.historyEmpty.classList.add('hidden');
+    if (els.historyTableWrapper) els.historyTableWrapper.classList.add('hidden');
+    if (els.historyTbody) els.historyTbody.innerHTML = '';
+
+    try {
+      const res = await apiFetch('/api/wallet/payouts');
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Failed to fetch payouts');
+      }
+      const payouts = await res.json();
+      if (els.historyLoading) els.historyLoading.classList.add('hidden');
+
+      const items = Array.isArray(payouts) ? payouts : (payouts.payouts || payouts.items || []);
+      if (!items || items.length === 0) {
+        if (els.historyEmpty) els.historyEmpty.classList.remove('hidden');
+        return;
+      }
+
+      if (els.historyTableWrapper) els.historyTableWrapper.classList.remove('hidden');
+      const rowsHtml = items.map(p => {
+        const amount = p.amount_microcredits || p.amount || 0;
+        const address = p.tempo_address || p.destination_address || p.address || '—';
+        const truncatedAddr = address.length > 18 ? `${address.slice(0, 8)}...${address.slice(-6)}` : address;
+        const status = (p.status || 'pending').toLowerCase();
+        let statusBadgeClass = 'badge-warning';
+        if (status === 'completed' || status === 'success' || status === 'confirmed') {
+          statusBadgeClass = 'badge-active';
+        } else if (status === 'failed' || status === 'rejected') {
+          statusBadgeClass = 'badge-error';
+        }
+
+        const dateStr = p.created_at ? new Date(p.created_at).toLocaleString() : '—';
+        const txHash = p.tx_hash || p.transaction_hash || p.tx || '';
+        const txDisplay = txHash ? `<code class="font-mono text-xs" title="${escapeHtml(txHash)}">${escapeHtml(txHash.slice(0, 10))}...</code>` : '<span class="text-muted">—</span>';
+
+        return `<tr>
+          <td><span class="text-muted font-mono">${escapeHtml(dateStr)}</span></td>
+          <td><strong>${formatMicrocredits(amount)}</strong><br><span class="text-muted text-xs">${microcreditsToUsd(amount)}</span></td>
+          <td><code class="font-mono" title="${escapeHtml(address)}">${escapeHtml(truncatedAddr)}</code></td>
+          <td><span class="badge ${statusBadgeClass}">${escapeHtml(status)}</span></td>
+          <td>${txDisplay}</td>
+        </tr>`;
+      }).join('');
+
+      if (els.historyTbody) els.historyTbody.innerHTML = rowsHtml;
+    } catch (e) {
+      if (els.historyLoading) els.historyLoading.classList.add('hidden');
+      if (els.historyEmpty) {
+        els.historyEmpty.classList.remove('hidden');
+        const p = els.historyEmpty.querySelector('p');
+        if (p) p.textContent = `Could not load payout history: ${e.message}`;
+      }
+    }
+  }
+
+  async function handlePayoutSubmit(e) {
+    if (e) e.preventDefault();
+    if (els.payoutError) els.payoutError.classList.add('hidden');
+    if (els.payoutSuccess) els.payoutSuccess.classList.add('hidden');
+
+    const address = (els.payoutAddress.value || '').trim();
+    const amount = parseInt(els.payoutAmount.value, 10);
+
+    // Strict Ethereum-style address check
+    if (!isValidEthAddress(address)) {
+      els.payoutErrorText.textContent = 'Invalid address: Must be a valid 42-character Ethereum-style wallet address starting with 0x (e.g. 0x71C...).';
+      els.payoutError.classList.remove('hidden');
+      els.payoutAddress.focus();
+      return;
+    }
+
+    if (isNaN(amount) || amount <= 0) {
+      els.payoutErrorText.textContent = 'Please enter a valid payout amount in microcredits (> 0).';
+      els.payoutError.classList.remove('hidden');
+      els.payoutAmount.focus();
+      return;
+    }
+
+    if (amount > state.sellerAvailable) {
+      els.payoutErrorText.textContent = `Insufficient funds: Requested ${formatMicrocredits(amount)}, but only ${formatMicrocredits(state.sellerAvailable)} is available for withdrawal.`;
+      els.payoutError.classList.remove('hidden');
+      return;
+    }
+
+    els.btnSubmitPayout.disabled = true;
+    els.payoutSubmitSpinner.classList.remove('hidden');
+    els.payoutSubmitText.textContent = 'Submitting Payout Request...';
+
+    try {
+      const res = await apiFetch('/api/wallet/payout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          amount_microcredits: amount,
+          tempo_address: address,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to submit payout request');
+      }
+
+      els.payoutSuccessText.innerHTML = `<strong>Payout requested!</strong> ${formatMicrocredits(amount)} queued for <code class="font-mono">${escapeHtml(address.slice(0, 10))}...</code>. Track status under Payout History.`;
+      els.payoutSuccess.classList.remove('hidden');
+      els.payoutAmount.value = '';
+      els.payoutAmountUsd.textContent = '≈ $0.00 AlphaUSD';
+
+      showToast(`Payout request for ${formatMicrocredits(amount)} submitted!`, 'success');
+      fetchWalletInfo();
+    } catch (err) {
+      els.payoutErrorText.textContent = err.message || 'Payout request failed';
+      els.payoutError.classList.remove('hidden');
+    } finally {
+      els.btnSubmitPayout.disabled = false;
+      els.payoutSubmitSpinner.classList.add('hidden');
+      els.payoutSubmitText.textContent = 'Confirm & Submit Payout Request';
+    }
+  }
+
   // Event Listeners Initialization
   function initEvents() {
     // Search input with debounce
@@ -999,6 +1345,77 @@
       els.uploadFileName.textContent = `Selected: ${file.name} (${formatBytes(file.size)})`;
       els.uploadFileName.classList.remove('hidden');
     }
+
+    // Wallet Modal Events
+    if (els.btnOpenWallet) {
+      els.btnOpenWallet.addEventListener('click', () => openWalletModal('funds'));
+    }
+    if (els.btnWalletModalClose) {
+      els.btnWalletModalClose.addEventListener('click', closeWalletModal);
+    }
+    if (els.btnWalletModalDone) {
+      els.btnWalletModalDone.addEventListener('click', closeWalletModal);
+    }
+    if (els.modalWallet) {
+      els.modalWallet.addEventListener('click', (e) => {
+        if (e.target === els.modalWallet) closeWalletModal();
+      });
+    }
+    if (els.btnCopyWalletAddress) {
+      els.btnCopyWalletAddress.addEventListener('click', copyWalletAddress);
+    }
+    if (els.btnQuickWithdraw) {
+      els.btnQuickWithdraw.addEventListener('click', () => switchWalletTab('withdraw'));
+    }
+
+    // Wallet Tabs
+    els.walletTabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        const tabName = tab.dataset.walletTab;
+        if (tabName) switchWalletTab(tabName);
+      });
+    });
+
+    // Payout Form & Validation
+    if (els.payoutAddress) {
+      els.payoutAddress.addEventListener('input', validatePayoutAddress);
+    }
+    if (els.btnUseOwnWallet) {
+      els.btnUseOwnWallet.addEventListener('click', () => {
+        if (state.walletAddress) {
+          els.payoutAddress.value = state.walletAddress;
+          validatePayoutAddress();
+        } else {
+          showToast('No node wallet address loaded yet', 'warning');
+        }
+      });
+    }
+    if (els.payoutAmount) {
+      els.payoutAmount.addEventListener('input', () => {
+        const val = parseInt(els.payoutAmount.value, 10) || 0;
+        els.payoutAmountUsd.textContent = microcreditsToUsd(val);
+      });
+    }
+    els.btnPresets.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const pct = parseFloat(btn.dataset.pct) || 0;
+        setPayoutPreset(pct);
+      });
+    });
+    if (els.payoutForm) {
+      els.payoutForm.addEventListener('submit', handlePayoutSubmit);
+    }
+
+    // Keyboard shortcut (Escape to close modals)
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (els.modalWallet && !els.modalWallet.classList.contains('hidden')) {
+          closeWalletModal();
+        } else if (els.modalIngest && !els.modalIngest.classList.contains('hidden')) {
+          closeModal();
+        }
+      }
+    });
   }
 
   // Auth Handlers

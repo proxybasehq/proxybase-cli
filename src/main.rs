@@ -779,6 +779,8 @@ async fn handle_webload(
             }
             if let Some(p) = auth_pass {
                 cfg.auth_pass = p;
+            } else if cfg.auth_pass == "mysecurepass" || cfg.auth_pass.is_empty() {
+                cfg.auth_pass = format!("pb_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
             }
             cfg.backend_url = cli_backend.to_string();
             save_webload_config(&cfg)?;
@@ -906,6 +908,8 @@ async fn execute_webload_start(
     }
     if let Some(ref p) = auth_pass {
         cfg.auth_pass = p.clone();
+    } else if !foreground || cfg.auth_pass == "mysecurepass" || cfg.auth_pass.is_empty() {
+        cfg.auth_pass = format!("pb_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     }
     cfg.backend_url = cli_backend.to_string();
     save_webload_config(&cfg)?;
@@ -1219,11 +1223,11 @@ impl BackendClient {
         data_dir().join("session_token")
     }
 
-    fn load_token() -> Option<String> {
+    pub(crate) fn load_token() -> Option<String> {
         std::fs::read_to_string(Self::token_path()).ok()
     }
 
-    fn save_token(token: &str) {
+    pub(crate) fn save_token(token: &str) {
         let path = Self::token_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1274,7 +1278,7 @@ impl BackendClient {
 
     // --- Wallet ---
 
-    async fn get_balance(&self) -> Result<serde_json::Value> {
+    pub(crate) async fn get_balance(&self) -> Result<serde_json::Value> {
         let resp = self
             .http
             .get(format!("{}/v2/wallet/balance", self.base_url))
@@ -1327,13 +1331,13 @@ impl BackendClient {
         Ok(resp.json().await?)
     }
 
-    async fn list_payouts(&self) -> Result<serde_json::Value> {
+    pub(crate) async fn list_payouts(&self) -> Result<serde_json::Value> {
         let resp = self.http.get(format!("{}/v2/payouts", self.base_url))
             .header("Authorization", self.bearer()).send().await?;
         Ok(resp.json().await?)
     }
 
-    async fn create_payout(&self, amount: i64, tempo_address: &str) -> Result<serde_json::Value> {
+    pub(crate) async fn create_payout(&self, amount: i64, tempo_address: &str) -> Result<serde_json::Value> {
         let resp = self
             .http
             .post(format!("{}/v2/payouts", self.base_url))
@@ -2529,7 +2533,7 @@ pub(crate) fn wallet_dir() -> std::path::PathBuf {
     data_dir()
 }
 
-fn load_wallet() -> Result<libproxybase::WalletManager> {
+pub(crate) fn load_wallet() -> Result<libproxybase::WalletManager> {
     let mut wm = libproxybase::WalletManager::new(wallet_dir())?;
 
     let env_pw = std::env::var("PROXYBASE_PASSWORD").unwrap_or_default();
@@ -2554,7 +2558,7 @@ fn load_wallet() -> Result<libproxybase::WalletManager> {
     Ok(wm)
 }
 
-async fn authenticate(client: &BackendClient, wm: &libproxybase::WalletManager) -> Result<String> {
+pub(crate) async fn authenticate(client: &BackendClient, wm: &libproxybase::WalletManager) -> Result<String> {
     let address = wm
         .address()
         .ok_or_else(|| anyhow::anyhow!("Wallet not loaded"))?;

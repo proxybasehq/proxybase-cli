@@ -59,6 +59,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/:id/cancel", post(handle_cancel_job))
         .route("/api/stats", get(handle_get_stats))
         .route("/api/seller/toggle", post(handle_toggle_seller))
+        .route("/api/wallet", get(handle_get_wallet))
+        .route("/api/wallet/payouts", get(handle_get_payouts))
+        .route("/api/wallet/payout", post(handle_create_payout))
         .route("/api/events", get(handle_sse_events))
         // Static assets & favicon
         .route("/", get(handle_index))
@@ -541,6 +544,256 @@ async fn handle_toggle_seller(
     Ok(Json(ToggleSellerResponse {
         is_running: new_state,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Wallet & Payout Handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WalletStatusResponse {
+    pub wallet_address: Option<String>,
+    pub is_authenticated: bool,
+    pub buyer_available: i64,
+    pub buyer_reserved: i64,
+    pub buyer_spent: i64,
+    pub seller_pending: i64,
+    pub seller_available: i64,
+    pub seller_payout_locked: i64,
+    pub spendable_balance: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreatePayoutPayload {
+    pub amount_microcredits: i64,
+    pub tempo_address: String,
+}
+
+/// Strict validation for Ethereum / Tempo style addresses:
+/// Must start with 0x (or 0X) followed by exactly 40 hex digits (42 chars total).
+pub fn is_valid_eth_address(addr: &str) -> bool {
+    let a = addr.trim();
+    if a.len() != 42 {
+        return false;
+    }
+    if !a.starts_with("0x") && !a.starts_with("0X") {
+        return false;
+    }
+    a[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+async fn get_authenticated_wallet_client(backend_url: &str) -> (crate::BackendClient, Option<String>) {
+    let mut client = crate::BackendClient::new(backend_url);
+    let wm = match crate::load_wallet() {
+        Ok(w) => w,
+        Err(_) => return (client, None),
+    };
+    let addr = wm.address().map(|s| s.to_string());
+    if !client.is_authenticated() {
+        if let Ok(_) = crate::authenticate(&client, &wm).await {
+            client.token = crate::BackendClient::load_token();
+        }
+    }
+    (client, addr)
+}
+
+async fn handle_get_wallet(State(state): State<AppState>) -> impl IntoResponse {
+    let (mut client, wallet_addr) = get_authenticated_wallet_client(&state.backend_url).await;
+    let Some(addr) = wallet_addr else {
+        return (
+            StatusCode::OK,
+            Json(WalletStatusResponse {
+                wallet_address: None,
+                is_authenticated: false,
+                buyer_available: 0,
+                buyer_reserved: 0,
+                buyer_spent: 0,
+                seller_pending: 0,
+                seller_available: 0,
+                seller_payout_locked: 0,
+                spendable_balance: 0,
+                error: Some("No wallet found on node. Run 'proxybase-cli wallet create' first.".to_string()),
+            }),
+        );
+    };
+
+    let bal_res = match client.get_balance().await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // Attempt re-auth once if token expired
+            if let Ok(wm) = crate::load_wallet() {
+                if crate::authenticate(&client, &wm).await.is_ok() {
+                    client.token = crate::BackendClient::load_token();
+                    client.get_balance().await
+                } else {
+                    Err(e)
+                }
+            } else {
+                Err(e)
+            }
+        }
+    };
+
+    match bal_res {
+        Ok(bal) => {
+            let buyer_available = bal.get("buyer_available").and_then(|v| v.as_i64()).unwrap_or(0);
+            let buyer_reserved = bal.get("buyer_reserved").and_then(|v| v.as_i64()).unwrap_or(0);
+            let buyer_spent = bal.get("buyer_spent").and_then(|v| v.as_i64()).unwrap_or(0);
+            let seller_pending = bal.get("seller_pending").and_then(|v| v.as_i64()).unwrap_or(0);
+            let seller_available = bal.get("seller_available").and_then(|v| v.as_i64()).unwrap_or(0);
+            let seller_payout_locked = bal.get("seller_payout_locked").and_then(|v| v.as_i64()).unwrap_or(0);
+            let spendable_balance = bal.get("spendable_balance").and_then(|v| v.as_i64()).unwrap_or(buyer_available);
+
+            (
+                StatusCode::OK,
+                Json(WalletStatusResponse {
+                    wallet_address: Some(addr),
+                    is_authenticated: true,
+                    buyer_available,
+                    buyer_reserved,
+                    buyer_spent,
+                    seller_pending,
+                    seller_available,
+                    seller_payout_locked,
+                    spendable_balance,
+                    error: None,
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::OK,
+            Json(WalletStatusResponse {
+                wallet_address: Some(addr),
+                is_authenticated: client.is_authenticated(),
+                buyer_available: 0,
+                buyer_reserved: 0,
+                buyer_spent: 0,
+                seller_pending: 0,
+                seller_available: 0,
+                seller_payout_locked: 0,
+                spendable_balance: 0,
+                error: Some(format!("Balance lookup failed: {e}")),
+            }),
+        ),
+    }
+}
+
+async fn handle_get_payouts(State(state): State<AppState>) -> impl IntoResponse {
+    let (mut client, wallet_addr) = get_authenticated_wallet_client(&state.backend_url).await;
+    if wallet_addr.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "No wallet found on node." })),
+        );
+    }
+
+    let payouts = match client.list_payouts().await {
+        Ok(p) => p,
+        Err(e) => {
+            if let Ok(wm) = crate::load_wallet() {
+                if crate::authenticate(&client, &wm).await.is_ok() {
+                    client.token = crate::BackendClient::load_token();
+                    match client.list_payouts().await {
+                        Ok(p) => p,
+                        Err(e2) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e2.to_string() }))),
+                    }
+                } else {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            } else {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    };
+
+    (StatusCode::OK, Json(payouts))
+}
+
+async fn handle_create_payout(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePayoutPayload>,
+) -> impl IntoResponse {
+    let tempo_address = payload.tempo_address.trim().to_string();
+
+    // 1. Strict Ethereum-style wallet address validation
+    if !is_valid_eth_address(&tempo_address) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid destination address. Payouts require a valid 42-character Ethereum-style wallet address starting with 0x (e.g., 0x71C...)."
+            })),
+        );
+    }
+
+    // 2. Validate amount
+    if payload.amount_microcredits <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Withdrawal amount must be greater than zero."
+            })),
+        );
+    }
+
+    let (mut client, wallet_addr) = get_authenticated_wallet_client(&state.backend_url).await;
+    if wallet_addr.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "No wallet found on node. Create or import a wallet first."
+            })),
+        );
+    }
+
+    // 3. Balance verification
+    if let Ok(bal) = client.get_balance().await {
+        let seller_available = bal.get("seller_available").and_then(|v| v.as_i64()).unwrap_or(0);
+        if payload.amount_microcredits > seller_available {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Insufficient seller funds. Requested {} microcredits, but available seller balance is {} microcredits.",
+                        payload.amount_microcredits, seller_available
+                    )
+                })),
+            );
+        }
+    }
+
+    // 4. Request payout
+    let res = match client.create_payout(payload.amount_microcredits, &tempo_address).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if let Ok(wm) = crate::load_wallet() {
+                if crate::authenticate(&client, &wm).await.is_ok() {
+                    client.token = crate::BackendClient::load_token();
+                    client.create_payout(payload.amount_microcredits, &tempo_address).await
+                } else {
+                    Err(e)
+                }
+            } else {
+                Err(e)
+            }
+        }
+    };
+
+    match res {
+        Ok(val) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "payout": val
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Payout request failed: {e}")
+            })),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,5 +1312,56 @@ mod tests {
         let json_asc: serde_json::Value = serde_json::from_slice(&body_asc).unwrap();
         assert_eq!(json_asc["items"][0]["host"], "1.1.1.1");
         assert_eq!(json_asc["items"][1]["host"], "9.9.9.9");
+    }
+
+    #[test]
+    fn test_is_valid_eth_address_validation() {
+        // Valid Ethereum addresses
+        assert!(is_valid_eth_address("0x7cfe68fa3e2d70b90bd630e9911c8e082b6c36e5"));
+        assert!(is_valid_eth_address("0X7CFE68FA3E2D70B90BD630E9911C8E082B6C36E5"));
+        assert!(is_valid_eth_address("0x0000000000000000000000000000000000000000"));
+        assert!(is_valid_eth_address("0xDeaDbeefdEAdbeefdeadbeefDEADbEEFdeadbeef"));
+        assert!(is_valid_eth_address("  0x7cfe68fa3e2d70b90bd630e9911c8e082b6c36e5  ")); // trimmed
+
+        // Invalid addresses
+        assert!(!is_valid_eth_address(""));
+        assert!(!is_valid_eth_address("0x123")); // too short
+        assert!(!is_valid_eth_address("0x7cfe68fa3e2d70b90bd630e9911c8e082b6c36e")); // 41 chars
+        assert!(!is_valid_eth_address("0x7cfe68fa3e2d70b90bd630e9911c8e082b6c36e5a")); // 43 chars
+        assert!(!is_valid_eth_address("7cfe68fa3e2d70b90bd630e9911c8e082b6c36e5")); // missing 0x prefix
+        assert!(!is_valid_eth_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")); // Bitcoin address
+        assert!(!is_valid_eth_address("0x7cfe68fa3e2d70b90bd630e9911c8e082b6c36z9")); // 'z' is not hex
+        assert!(!is_valid_eth_address("0x7cfe68fa3e2d70b90bd630e9911c8e082b6c36!@")); // special chars
+    }
+
+    #[tokio::test]
+    async fn test_api_wallet_endpoint_structure() {
+        let (app, _, _) = setup_test_app().await;
+        let req = auth_req("GET", "/api/wallet").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("buyer_available").is_some());
+        assert!(json.get("seller_available").is_some());
+        assert!(json.get("spendable_balance").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_api_payout_rejects_invalid_eth_address() {
+        let (app, _, _) = setup_test_app().await;
+        let payload = serde_json::json!({
+            "amount_microcredits": 10000,
+            "tempo_address": "invalid_btc_address_12345"
+        });
+        let req = auth_req("POST", "/api/wallet/payout")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("Ethereum-style"));
     }
 }
