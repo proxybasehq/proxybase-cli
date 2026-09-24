@@ -410,6 +410,45 @@ impl WebloadDb {
         Ok((new_status.to_string(), path_id))
     }
 
+    /// Retrieve a single proxy record by ID.
+    pub fn get_proxy(&self, id: i64) -> Result<Option<ProxyRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path_id, address, host, port, username, password,
+                    country, category, label, raw_input, status,
+                    last_latency_ms, last_tested_at, consecutive_failures,
+                    total_streams, total_bytes_relayed, created_at
+             FROM proxies WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query([id])?;
+        if let Some(r) = rows.next()? {
+            let lat_opt: Option<i64> = r.get(12)?;
+            Ok(Some(ProxyRecord {
+                id: r.get(0)?,
+                path_id: r.get(1)?,
+                address: r.get(2)?,
+                host: r.get(3)?,
+                port: r.get(4)?,
+                username: r.get(5)?,
+                password: r.get(6)?,
+                country: r.get(7)?,
+                category: r.get(8)?,
+                label: r.get(9)?,
+                raw_input: r.get(10)?,
+                status: r.get(11)?,
+                last_latency_ms: lat_opt.map(|l| l as u64),
+                last_tested_at: r.get(13)?,
+                consecutive_failures: r.get::<_, i64>(14)? as u32,
+                total_streams: r.get::<_, i64>(15)? as u64,
+                total_bytes_relayed: r.get::<_, i64>(16)? as u64,
+                created_at: r.get(17)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Set status of an individual proxy by ID explicitly.
     pub fn set_proxy_status(&self, id: i64, status: &str) -> Result<String> {
         let conn = self.conn.lock().unwrap();

@@ -452,19 +452,22 @@
   // Test Single Proxy Handshake
   async function testProxy(id) {
     try {
-      showToast(`Testing proxy handshake...`, 'info');
+      showToast(`Testing proxy #${id} handshake...`, 'info');
       const res = await apiFetch(`/api/proxies/${id}/test`, { method: 'POST' });
-      if (!res.ok) throw new Error('Test request failed');
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(errText || `HTTP ${res.status}`);
+      }
       const data = await res.json();
 
       if (data.is_success) {
-        showToast(`Proxy responded in ${data.latency_ms}ms`, 'success');
+        showToast(`Proxy #${id} responded in ${data.latency_ms}ms`, 'success');
       } else {
-        showToast(`Proxy failed: ${data.error_message || 'Connection error'}`, 'error');
+        showToast(`Proxy #${id} failed: ${data.error_message || 'Connection error'}`, 'error');
       }
       fetchProxies();
     } catch (e) {
-      showToast('Probe error: ' + e.message, 'error');
+      showToast(`Probe error (Proxy #${id}): ${e.message}`, 'error');
     }
   }
 

@@ -231,7 +231,7 @@ pub async fn probe_proxy_endpoint(
     let start = tokio::time::Instant::now();
 
     let res = match (username, password) {
-        (Some(u), Some(p)) => {
+        (Some(u), Some(p)) if !u.is_empty() => {
             tokio::time::timeout(
                 timeout_dur,
                 fast_socks5::client::Socks5Stream::connect_with_password(
@@ -263,8 +263,22 @@ pub async fn probe_proxy_endpoint(
 
     match res {
         Ok(Ok(_stream)) => (true, Some(elapsed), None),
-        Ok(Err(e)) => (false, None, Some(e.to_string())),
-        Err(_) => (false, None, Some("Connection timed out".to_string())),
+        Ok(Err(e)) => {
+            let err_str = e.to_string();
+            let clean_err = if err_str.contains("Authentication") || err_str.contains("rejected") {
+                format!("Authentication rejected by proxy provider (check credentials or IP whitelist): {}", err_str)
+            } else if err_str.contains("refused") {
+                format!("Connection refused by proxy server: {}", err_str)
+            } else {
+                err_str
+            };
+            (false, None, Some(clean_err))
+        }
+        Err(_) => (
+            false,
+            None,
+            Some(format!("Connection timed out after {}s (proxy unreachable)", timeout_secs)),
+        ),
     }
 }
 

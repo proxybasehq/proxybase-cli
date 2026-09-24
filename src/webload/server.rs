@@ -384,27 +384,14 @@ async fn handle_test_proxy(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<TestProxyResponse>, (StatusCode, String)> {
-    let (address, username, password) = {
-        let conn = state.db.clone();
-        // Query single proxy info
-        let filter = ProxyQueryFilter {
-            page: Some(1),
-            limit: Some(1),
-            ..Default::default()
-        };
-        let page = conn
-            .query_proxies(&filter)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let p = page
-            .items
-            .into_iter()
-            .find(|item| item.id == id)
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Proxy not found".to_string()))?;
-        (p.address, p.username, p.password)
-    };
+    let p = state
+        .db
+        .get_proxy(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Proxy #{} not found", id)))?;
 
     let (is_success, latency, err) =
-        probe_proxy_endpoint(&address, username.as_deref(), password.as_deref(), 5).await;
+        probe_proxy_endpoint(&p.address, p.username.as_deref(), p.password.as_deref(), 5).await;
 
     let _ = state.db.update_proxy_test_result(id, latency, is_success);
 
