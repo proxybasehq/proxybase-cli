@@ -677,9 +677,16 @@ async fn handle_webload(
 
             if pid_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = content.trim().parse::<i32>() {
+                    if let Ok(pid) = content.trim().parse::<u32>() {
+                        #[cfg(unix)]
                         unsafe {
-                            libc::kill(pid, libc::SIGTERM);
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/PID", &pid.to_string(), "/F"])
+                                .output();
                         }
                         stopped = true;
                     }
@@ -782,7 +789,9 @@ async fn handle_webload(
             #[cfg(target_os = "linux")]
             println!("User-level systemd service: ~/.config/systemd/user/proxybase-webload.service");
             #[cfg(target_os = "macos")]
-            println!("User-level launchd agent: ~/Library/LaunchAgents/proxybase-webload.plist");
+            println!("User-level launchd agent: ~/Library/LaunchAgents/com.proxybase-webload.plist");
+            #[cfg(target_os = "windows")]
+            println!("Windows Startup: ProxyBase Webload configured to auto-start");
             Ok(())
         }
 
