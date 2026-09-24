@@ -51,6 +51,10 @@
     username: isSessionFresh ? savedUsername : '',
     expiresAt: isSessionFresh ? savedExpiresAt : 0,
     eventSource: null,
+    backendUrl: 'https://api.proxybase.xyz',
+    activeUpstreamPaths: 0,
+    activeStreams: 0,
+    bytesPerSec: 0,
   };
 
   // DOM Elements Cache
@@ -80,6 +84,16 @@
     relayStatusDot: document.getElementById('relay-status-dot'),
     relayBtnText: document.getElementById('relay-btn-text'),
     btnToggleRelay: document.getElementById('btn-toggle-relay'),
+
+    // Production Gateway Status Banner
+    backendStatusCard: document.getElementById('backend-status-card'),
+    backendPulseDot: document.getElementById('backend-pulse-dot'),
+    backendStatusHeadline: document.getElementById('backend-status-headline'),
+    backendTagBadge: document.getElementById('backend-tag-badge'),
+    backendStatusSub: document.getElementById('backend-status-sub'),
+    backendMetricGateway: document.getElementById('backend-metric-gateway'),
+    backendMetricPaths: document.getElementById('backend-metric-paths'),
+    backendMetricActivity: document.getElementById('backend-metric-activity'),
 
     // Toolbar & Filters
     searchInput: document.getElementById('search-input'),
@@ -389,6 +403,11 @@
       if (!res.ok) return;
       const data = await res.json();
 
+      if (data.backend_url) state.backendUrl = data.backend_url;
+      if (data.active_upstream_paths !== undefined) state.activeUpstreamPaths = data.active_upstream_paths;
+      if (data.active_streams !== undefined) state.activeStreams = data.active_streams;
+      if (data.bytes_per_sec !== undefined) state.bytesPerSec = data.bytes_per_sec;
+
       if (els.statTotal) els.statTotal.textContent = formatNumber(data.total_proxies);
       if (els.statActive) els.statActive.textContent = formatNumber(data.active_proxies);
       if (els.statPaused) els.statPaused.textContent = formatNumber(data.paused_proxies);
@@ -397,8 +416,8 @@
       if (els.statStreams && data.active_streams !== undefined) {
         els.statStreams.textContent = formatNumber(data.active_streams);
       }
-      if (els.statThroughput && data.total_bytes_relayed !== undefined) {
-        els.statThroughput.textContent = formatBytes(data.total_bytes_relayed);
+      if (els.statThroughput) {
+        els.statThroughput.textContent = `${formatBytes(data.bytes_per_sec || 0)}/s`;
       }
 
       if (data.is_relay_running !== undefined) {
@@ -527,14 +546,48 @@
   }
 
   function updateRelayUi() {
+    const cleanGw = (state.backendUrl || 'api.proxybase.xyz').replace(/^https?:\/\//, '');
+
     if (state.isRelayRunning) {
       els.relayStatusDot.className = 'relay-indicator online';
       els.relayBtnText.textContent = 'Seller Online';
       els.btnToggleRelay.className = 'btn btn-success';
+
+      if (els.backendStatusCard) {
+        els.backendStatusCard.className = 'backend-status-card online';
+        els.backendStatusHeadline.textContent = `Connected to Production Gateway (${cleanGw})`;
+        els.backendTagBadge.textContent = 'Seller Online';
+        els.backendTagBadge.className = 'backend-tag-badge';
+
+        const pathsCount = state.activeUpstreamPaths || (state.proxies ? state.proxies.length : 0);
+        if (state.activeStreams > 0) {
+          els.backendStatusSub.innerHTML = `<strong>Relaying Active Traffic:</strong> ${formatNumber(state.activeStreams)} active stream(s) currently routing through your upstream nodes.`;
+          els.backendMetricActivity.textContent = `Relaying (${formatBytes(state.bytesPerSec)}/s)`;
+        } else {
+          els.backendStatusSub.innerHTML = `<strong>Connected & Verified:</strong> Upstream proxies are registered on the ProxyBase marketplace. Waiting for incoming buyer crawler streams.`;
+          els.backendMetricActivity.textContent = 'Awaiting Buyer Requests';
+        }
+
+        els.backendMetricGateway.textContent = cleanGw;
+        els.backendMetricPaths.textContent = `${pathsCount} active`;
+      }
     } else {
       els.relayStatusDot.className = 'relay-indicator';
       els.relayBtnText.textContent = 'Seller Offline';
       els.btnToggleRelay.className = 'btn btn-secondary';
+
+      if (els.backendStatusCard) {
+        els.backendStatusCard.className = 'backend-status-card standby';
+        els.backendStatusHeadline.textContent = 'Seller Relay Standby (Offline)';
+        els.backendTagBadge.textContent = 'Standby';
+        els.backendTagBadge.className = 'backend-tag-badge standby';
+
+        const totalActive = els.statActive ? els.statActive.textContent : '0';
+        els.backendStatusSub.innerHTML = `Proxies are loaded locally. Click <strong>[Seller Offline]</strong> in the top header to connect your proxies to ${cleanGw}.`;
+        els.backendMetricGateway.textContent = cleanGw;
+        els.backendMetricPaths.textContent = `${totalActive} loaded`;
+        els.backendMetricActivity.textContent = 'Offline (Standby)';
+      }
     }
   }
 
@@ -684,9 +737,14 @@
 
         // Live Relay Telemetry Event
         if (msg.type === 'telemetry') {
-          els.statStreams.textContent = formatNumber(msg.active_streams);
-          els.statThroughput.textContent = `${formatBytes(msg.bytes_per_sec)}/s`;
-          state.isRelayRunning = msg.is_relay_running;
+          state.activeStreams = msg.active_streams || 0;
+          state.bytesPerSec = msg.bytes_per_sec || 0;
+          if (msg.active_upstream_paths !== undefined) {
+            state.activeUpstreamPaths = msg.active_upstream_paths;
+          }
+          if (els.statStreams) els.statStreams.textContent = formatNumber(msg.active_streams);
+          if (els.statThroughput) els.statThroughput.textContent = `${formatBytes(msg.bytes_per_sec)}/s`;
+          state.isRelayRunning = !!msg.is_relay_running;
           updateRelayUi();
         }
       } catch (err) {

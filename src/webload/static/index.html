@@ -191,6 +191,36 @@
         </div>
       </div>
 
+      <!-- Network & Production Gateway Status Banner -->
+      <div id="backend-status-card" class="backend-status-card standby">
+        <div class="backend-status-left">
+          <span class="status-pulse-dot" id="backend-pulse-dot"></span>
+          <div class="backend-status-info">
+            <div class="backend-status-headline-row">
+              <span class="backend-status-headline" id="backend-status-headline">Seller Relay Standby (Offline)</span>
+              <span class="backend-tag-badge" id="backend-tag-badge">Production Gateway</span>
+            </div>
+            <span class="backend-status-sub" id="backend-status-sub">
+              Proxies are saved locally. Click <strong>[Seller Offline]</strong> in the top header to connect your proxies to the ProxyBase network.
+            </span>
+          </div>
+        </div>
+        <div class="backend-status-right">
+          <div class="backend-metric">
+            <span class="metric-label">Gateway</span>
+            <span class="metric-value font-mono" id="backend-metric-gateway">api.proxybase.xyz</span>
+          </div>
+          <div class="backend-metric">
+            <span class="metric-label">Registered Paths</span>
+            <span class="metric-value" id="backend-metric-paths">0</span>
+          </div>
+          <div class="backend-metric">
+            <span class="metric-label">Market Status</span>
+            <span class="metric-value highlight" id="backend-metric-activity">Standby</span>
+          </div>
+        </div>
+      </div>
+
       <!-- Controls & Filter Toolbar -->
       <section class="toolbar">
         <div class="toolbar-search">

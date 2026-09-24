@@ -36,6 +36,88 @@ struct Cli {
     command: Commands,
 }
 
+/// Bulk proxy management CLI arguments and subcommands
+#[derive(clap::Args, Debug, Clone)]
+pub struct WebloadArgs {
+    #[command(subcommand)]
+    pub cmd: Option<WebloadCmd>,
+
+    /// Initial proxy file to import
+    #[arg(short, long)]
+    pub file: Option<std::path::PathBuf>,
+    /// Web UI listening port (default: 8787)
+    #[arg(short, long)]
+    pub port: Option<u16>,
+    /// Bind interface (default: 127.0.0.1)
+    #[arg(short, long)]
+    pub bind: Option<String>,
+    /// Custom SQLite database path (default: ~/.proxybase/webload.db)
+    #[arg(long)]
+    pub db: Option<std::path::PathBuf>,
+    /// Disable automatic browser opening
+    #[arg(long)]
+    pub no_open: bool,
+    /// Automatically start seller relay upon web server launch
+    #[arg(long)]
+    pub start_seller: bool,
+    /// Optional username for Web UI authentication (default: admin)
+    #[arg(long)]
+    pub auth_user: Option<String>,
+    /// Optional password for Web UI authentication (default: auto-generated or saved)
+    #[arg(long)]
+    pub auth_pass: Option<String>,
+    /// Run in foreground (don't daemonize). Used internally by the service manager.
+    #[arg(long)]
+    pub foreground: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WebloadCmd {
+    /// Start webload (daemonizes by default, use --foreground to keep in terminal)
+    Start {
+        /// Initial proxy file to import
+        #[arg(short, long)]
+        file: Option<std::path::PathBuf>,
+        /// Web UI listening port (default: 8787)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Bind interface (default: 127.0.0.1)
+        #[arg(short, long)]
+        bind: Option<String>,
+        /// Custom SQLite database path (default: ~/.proxybase/webload.db)
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
+        /// Disable automatic browser opening
+        #[arg(long)]
+        no_open: bool,
+        /// Automatically start seller relay upon web server launch
+        #[arg(long)]
+        start_seller: bool,
+        /// Optional username for Web UI authentication (default: admin)
+        #[arg(long)]
+        auth_user: Option<String>,
+        /// Optional password for Web UI authentication (default: auto-generated or saved)
+        #[arg(long)]
+        auth_pass: Option<String>,
+        /// Run in foreground (don't daemonize)
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the background webload daemon and autostart service
+    Stop,
+    /// Show webload daemon status (PID, URL, credentials)
+    Status,
+    /// Install webload as a user-level autostart service (systemd/launchd) — survives reboots
+    Install,
+    /// Restart the background webload daemon
+    Restart {
+        #[arg(long)]
+        auth_user: Option<String>,
+        #[arg(long)]
+        auth_pass: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Wallet management
@@ -50,33 +132,8 @@ enum Commands {
         #[command(subcommand)]
         cmd: SellerCmd,
     },
-    /// Launch embedded bulk proxy management web UI (supports 1M+ proxies with pagination & hot upstream control)
-    Webload {
-        /// Initial proxy file to import
-        #[arg(short, long)]
-        file: Option<std::path::PathBuf>,
-        /// Web UI listening port (default: 8787)
-        #[arg(short, long, default_value = "8787")]
-        port: u16,
-        /// Bind interface (default: 127.0.0.1)
-        #[arg(short, long, default_value = "127.0.0.1")]
-        bind: String,
-        /// Custom SQLite database path (default: ~/.proxybase/webload.db)
-        #[arg(long)]
-        db: Option<std::path::PathBuf>,
-        /// Disable automatic browser opening
-        #[arg(long)]
-        no_open: bool,
-        /// Automatically start seller relay upon web server launch
-        #[arg(long)]
-        start_seller: bool,
-        /// Optional username for Web UI authentication (default: admin)
-        #[arg(long)]
-        auth_user: Option<String>,
-        /// Optional password for Web UI authentication (default: auto-generated)
-        #[arg(long)]
-        auth_pass: Option<String>,
-    },
+    /// Bulk proxy management web engine (daemonizes by default, use --foreground to keep in terminal)
+    Webload(WebloadArgs),
     /// Buyer operations
     Buyer {
         #[command(subcommand)]
@@ -207,32 +264,7 @@ enum SellerCmd {
     /// Install seller as a system service (launchd/systemd) — survives reboots
     Install,
     /// Launch embedded bulk proxy management web UI
-    Webload {
-        /// Initial proxy file to import
-        #[arg(short, long)]
-        file: Option<std::path::PathBuf>,
-        /// Web UI listening port (default: 8787)
-        #[arg(short, long, default_value = "8787")]
-        port: u16,
-        /// Bind interface (default: 127.0.0.1)
-        #[arg(short, long, default_value = "127.0.0.1")]
-        bind: String,
-        /// Custom SQLite database path (default: ~/.proxybase/webload.db)
-        #[arg(long)]
-        db: Option<std::path::PathBuf>,
-        /// Disable automatic browser opening
-        #[arg(long)]
-        no_open: bool,
-        /// Automatically start seller relay upon web server launch
-        #[arg(long)]
-        start_seller: bool,
-        /// Optional username for Web UI authentication (default: admin)
-        #[arg(long)]
-        auth_user: Option<String>,
-        /// Optional password for Web UI authentication (default: auto-generated)
-        #[arg(long)]
-        auth_pass: Option<String>,
-    },
+    Webload(WebloadArgs),
 }
 
 #[derive(Subcommand)]
@@ -547,6 +579,437 @@ fn seller_daemon() -> daemon_kit::Daemon {
         ])
         .description("ProxyBase Seller — bandwidth resale daemon");
     daemon_kit::Daemon::new(config)
+}
+
+fn webload_daemon() -> daemon_kit::Daemon {
+    let config = daemon_kit::DaemonConfig::new("proxybase-webload")
+        .pid_dir(wallet_dir())
+        .log_file(wallet_dir().join("webload.log"))
+        .service_args(vec![
+            "webload".to_string(),
+            "start".to_string(),
+            "--foreground".to_string(),
+        ])
+        .description("ProxyBase Webload — bulk upstream proxy management service");
+    daemon_kit::Daemon::new(config)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebloadDaemonConfig {
+    pub port: u16,
+    pub bind: String,
+    pub db_path: Option<String>,
+    pub no_open: bool,
+    pub start_seller: bool,
+    pub auth_user: String,
+    pub auth_pass: String,
+    pub backend_url: String,
+}
+
+impl Default for WebloadDaemonConfig {
+    fn default() -> Self {
+        Self {
+            port: 8787,
+            bind: "127.0.0.1".to_string(),
+            db_path: None,
+            no_open: false,
+            start_seller: false,
+            auth_user: "admin".to_string(),
+            auth_pass: format!("pb_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+            backend_url: DEFAULT_BACKEND_URL.to_string(),
+        }
+    }
+}
+
+pub fn webload_config_path() -> std::path::PathBuf {
+    wallet_dir().join("webload.json")
+}
+
+pub fn load_webload_config() -> Result<WebloadDaemonConfig> {
+    let path = webload_config_path();
+    let content = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&content)?)
+}
+
+pub fn load_webload_config_or_default() -> WebloadDaemonConfig {
+    load_webload_config().unwrap_or_default()
+}
+
+pub fn save_webload_config(cfg: &WebloadDaemonConfig) -> Result<()> {
+    let path = webload_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(cfg)?)?;
+    Ok(())
+}
+
+async fn handle_webload(
+    cli_backend: &str,
+    args: WebloadArgs,
+) -> Result<()> {
+    let subcmd = args.cmd;
+    let file = args.file;
+    let port = args.port;
+    let bind = args.bind;
+    let db = args.db;
+    let no_open = args.no_open;
+    let start_seller = args.start_seller;
+    let auth_user = args.auth_user;
+    let auth_pass = args.auth_pass;
+    let foreground = args.foreground;
+
+    match subcmd {
+        Some(WebloadCmd::Stop) => {
+            let daemon = webload_daemon();
+            let pid_path = wallet_dir().join("proxybase-webload.pid");
+            let mut stopped = false;
+
+            match daemon.stop() {
+                Ok(()) => {
+                    stopped = true;
+                }
+                Err(daemon_kit::DaemonError::NotRunning) => {}
+                Err(e) => {
+                    eprintln!("Warning: daemon-kit stop returned: {e}");
+                }
+            }
+
+            if pid_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = content.trim().parse::<i32>() {
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
+                        }
+                        stopped = true;
+                    }
+                }
+                let _ = std::fs::remove_file(&pid_path);
+            }
+
+            if stopped {
+                println!("Webload daemon stopped.");
+            } else {
+                println!("Webload daemon is not running.");
+            }
+
+            if let Err(e) = daemon.uninstall_service() {
+                let err_str = e.to_string();
+                if !err_str.contains("not found") && !err_str.contains("No such file") {
+                    eprintln!("Warning: could not uninstall autostart service: {e}");
+                }
+            } else {
+                println!("Autostart service removed.");
+            }
+            Ok(())
+        }
+
+        Some(WebloadCmd::Status) => {
+            let daemon = webload_daemon();
+            let pid_path = wallet_dir().join("proxybase-webload.pid");
+            let log_path = wallet_dir().join("webload.log");
+            let cfg = load_webload_config_or_default();
+            let db_path = cfg
+                .db_path
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| data_dir().join("webload.db"));
+
+            let running_pid = daemon.running_pid().or_else(|| {
+                if pid_path.exists() {
+                    std::fs::read_to_string(&pid_path)
+                        .ok()?
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                } else {
+                    None
+                }
+            });
+
+            if let Some(pid) = running_pid {
+                println!("Daemon:     running (PID: {pid})");
+                println!("Web UI:     http://{}:{}", cfg.bind, cfg.port);
+                println!("Username:   {}", cfg.auth_user);
+                println!("Password:   {}", cfg.auth_pass);
+                println!("Database:   {}", db_path.display());
+                println!("Logs:       {}", log_path.display());
+                println!(
+                    "Seller:     {}",
+                    if cfg.start_seller {
+                        "auto-start on launch"
+                    } else {
+                        "standby (manual toggle)"
+                    }
+                );
+            } else {
+                println!("Daemon:     not running");
+                println!("Config URL: http://{}:{}", cfg.bind, cfg.port);
+                println!("Logs:       {}", log_path.display());
+            }
+            Ok(())
+        }
+
+        Some(WebloadCmd::Install) => {
+            let mut cfg = load_webload_config_or_default();
+            if let Some(p) = port {
+                cfg.port = p;
+            }
+            if let Some(b) = bind {
+                cfg.bind = b;
+            }
+            if let Some(d) = db {
+                cfg.db_path = Some(d.to_string_lossy().to_string());
+            }
+            if no_open {
+                cfg.no_open = true;
+            }
+            if start_seller {
+                cfg.start_seller = true;
+            }
+            if let Some(u) = auth_user {
+                cfg.auth_user = u;
+            }
+            if let Some(p) = auth_pass {
+                cfg.auth_pass = p;
+            }
+            cfg.backend_url = cli_backend.to_string();
+            save_webload_config(&cfg)?;
+
+            let daemon = webload_daemon();
+            daemon.install_service()?;
+            println!("Webload service installed. It will auto-start on boot and automatically restart on failure.");
+            #[cfg(target_os = "linux")]
+            println!("User-level systemd service: ~/.config/systemd/user/proxybase-webload.service");
+            #[cfg(target_os = "macos")]
+            println!("User-level launchd agent: ~/Library/LaunchAgents/proxybase-webload.plist");
+            Ok(())
+        }
+
+        Some(WebloadCmd::Restart {
+            auth_user: r_user,
+            auth_pass: r_pass,
+        }) => {
+            let daemon = webload_daemon();
+            if daemon.is_running() {
+                let _ = daemon.stop();
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            let start_args = WebloadArgs {
+                cmd: Some(WebloadCmd::Start {
+                    file,
+                    port,
+                    bind,
+                    db,
+                    no_open,
+                    start_seller,
+                    auth_user: r_user.or(auth_user),
+                    auth_pass: r_pass.or(auth_pass),
+                    foreground,
+                }),
+                file: None,
+                port: None,
+                bind: None,
+                db: None,
+                no_open: false,
+                start_seller: false,
+                auth_user: None,
+                auth_pass: None,
+                foreground: false,
+            };
+            Box::pin(handle_webload(cli_backend, start_args)).await
+        }
+
+        Some(WebloadCmd::Start {
+            file: f,
+            port: p,
+            bind: b,
+            db: d,
+            no_open: no,
+            start_seller: ss,
+            auth_user: au,
+            auth_pass: ap,
+            foreground: fg,
+        }) => {
+            execute_webload_start(
+                cli_backend,
+                f.or(file),
+                p.or(port),
+                b.or(bind),
+                d.or(db),
+                no_open || no,
+                start_seller || ss,
+                au.or(auth_user),
+                ap.or(auth_pass),
+                foreground || fg,
+            )
+            .await
+        }
+
+        None => {
+            execute_webload_start(
+                cli_backend,
+                file,
+                port,
+                bind,
+                db,
+                no_open,
+                start_seller,
+                auth_user,
+                auth_pass,
+                foreground,
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_webload_start(
+    cli_backend: &str,
+    file: Option<std::path::PathBuf>,
+    port: Option<u16>,
+    bind: Option<String>,
+    db: Option<std::path::PathBuf>,
+    no_open: bool,
+    start_seller: bool,
+    auth_user: Option<String>,
+    auth_pass: Option<String>,
+    foreground: bool,
+) -> Result<()> {
+    let mut cfg = load_webload_config_or_default();
+    if let Some(p) = port {
+        cfg.port = p;
+    }
+    if let Some(b) = bind {
+        cfg.bind = b;
+    }
+    if let Some(ref d) = db {
+        cfg.db_path = Some(d.to_string_lossy().to_string());
+    }
+    if no_open {
+        cfg.no_open = true;
+    }
+    if start_seller {
+        cfg.start_seller = true;
+    }
+    if let Some(ref u) = auth_user {
+        cfg.auth_user = u.clone();
+    }
+    if let Some(ref p) = auth_pass {
+        cfg.auth_pass = p.clone();
+    }
+    cfg.backend_url = cli_backend.to_string();
+    save_webload_config(&cfg)?;
+
+    let db_path = cfg
+        .db_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| data_dir().join("webload.db"));
+    let ui_url = format!("http://{}:{}", cfg.bind, cfg.port);
+    let pid_path = wallet_dir().join("proxybase-webload.pid");
+
+    if foreground {
+        if let Some(parent) = pid_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
+        let opts = webload::WebloadOptions {
+            bind: cfg.bind.clone(),
+            port: cfg.port,
+            db_path,
+            initial_file: file,
+            no_open: cfg.no_open,
+            start_seller: cfg.start_seller,
+            backend_url: cli_backend.to_string(),
+            auth_user: Some(cfg.auth_user.clone()),
+            auth_pass: Some(cfg.auth_pass.clone()),
+        };
+        let res = webload::run_webload_server(opts).await;
+        let _ = std::fs::remove_file(&pid_path);
+        res
+    } else {
+        let daemon = webload_daemon();
+        if daemon.is_running() {
+            let pid = daemon.running_pid().unwrap_or(0);
+            println!("Webload daemon is already running (PID: {pid}).");
+            println!("Web UI URL:    {ui_url}");
+            println!("Use 'proxybase-cli webload stop' first, or 'proxybase-cli webload status'.");
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe().context("Cannot determine current executable path")?;
+        let log_path = wallet_dir().join("webload.log");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .context("Cannot open webload log file")?;
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("webload")
+            .arg("start")
+            .arg("--foreground")
+            .arg("--port")
+            .arg(cfg.port.to_string())
+            .arg("--bind")
+            .arg(&cfg.bind)
+            .arg("--backend")
+            .arg(cli_backend);
+        if cfg.start_seller {
+            cmd.arg("--start-seller");
+        }
+        cmd.arg("--no-open");
+        if let Some(ref d) = cfg.db_path {
+            cmd.arg("--db").arg(d);
+        }
+        if let Some(ref f) = file {
+            cmd.arg("--file").arg(f);
+        }
+        cmd.arg("--auth-user").arg(&cfg.auth_user);
+        cmd.arg("--auth-pass").arg(&cfg.auth_pass);
+
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file);
+        let child = cmd.spawn().context("Failed to spawn webload daemon process")?;
+
+        if let Some(parent) = pid_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&pid_path, child.id().to_string());
+
+        println!("\n\x1b[1;36m");
+        println!("   ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗██████╗  █████╗ ███████╗███████╗");
+        println!("   ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝██╔══██╗██╔══██╗██╔════╝██╔════╝");
+        println!("   ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ ██████╔╝███████║███████╗█████╗  ");
+        println!("   ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  ██╔══██╗██╔══██║╚════██║██╔══╝  ");
+        println!("   ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   ██████╔╝██║  ██║███████║███████╗");
+        println!("   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝");
+        println!("                  [ High-Capacity Webload Proxy Engine ]\x1b[0m\n");
+        println!("╔════════════════════════════════════════════════════════════════════════════╗");
+        println!("║                 ProxyBase Webload Background Daemon Started                ║");
+        println!("╠════════════════════════════════════════════════════════════════════════════╣");
+        println!("║ Status:            Running in background (PID: {:<27}) ║", child.id());
+        println!("║ Web UI URL:        {:<56} ║", ui_url);
+        println!("║ Username:          {:<56} ║", cfg.auth_user);
+        println!("║ Password:          {:<56} ║", cfg.auth_pass);
+        println!("║ Database Path:     {:<56} ║", db_path.display());
+        println!("║ Backend Gateway:   {:<56} ║", cfg.backend_url);
+        println!("║ Logs:              {:<56} ║", log_path.display());
+        println!("║ Stop Command:      proxybase-cli webload stop                              ║");
+        println!("║ Status Command:    proxybase-cli webload status                            ║");
+        println!("╚════════════════════════════════════════════════════════════════════════════╝\n");
+
+        if !no_open {
+            let _ = open::that(&ui_url);
+        }
+        Ok(())
+    }
 }
 
 /// Build the list of paths: direct (None) + each upstream proxy.
@@ -2297,29 +2760,8 @@ async fn main() -> Result<()> {
         Commands::Seller { cmd } => {
             // Standalone inspection / diagnostic / daemon commands (no auth required)
             match &cmd {
-                SellerCmd::Webload {
-                    file,
-                    port,
-                    bind,
-                    db,
-                    no_open,
-                    start_seller,
-                    auth_user,
-                    auth_pass,
-                } => {
-                    let db_path = db.clone().unwrap_or_else(|| data_dir().join("webload.db"));
-                    let opts = webload::WebloadOptions {
-                        bind: bind.clone(),
-                        port: *port,
-                        db_path,
-                        initial_file: file.clone(),
-                        no_open: *no_open,
-                        start_seller: *start_seller,
-                        backend_url: cli.backend.clone(),
-                        auth_user: auth_user.clone(),
-                        auth_pass: auth_pass.clone(),
-                    };
-                    webload::run_webload_server(opts).await?;
+                SellerCmd::Webload(args) => {
+                    handle_webload(&cli.backend, args.clone()).await?;
                     return Ok(());
                 }
                 SellerCmd::ParseUpstreams { file, json } => {
@@ -2727,7 +3169,7 @@ async fn main() -> Result<()> {
                 | SellerCmd::Install
                 | SellerCmd::ParseUpstreams { .. }
                 | SellerCmd::TestUpstreams { .. }
-                | SellerCmd::Webload { .. } => {
+                | SellerCmd::Webload(_) => {
                     // Handled above (before auth check)
                     unreachable!();
                 }
@@ -3107,29 +3549,8 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&health)?);
         }
 
-        Commands::Webload {
-            file,
-            port,
-            bind,
-            db,
-            no_open,
-            start_seller,
-            auth_user,
-            auth_pass,
-        } => {
-            let db_path = db.unwrap_or_else(|| data_dir().join("webload.db"));
-            let opts = webload::WebloadOptions {
-                bind,
-                port,
-                db_path,
-                initial_file: file,
-                no_open,
-                start_seller,
-                backend_url: cli.backend.clone(),
-                auth_user,
-                auth_pass,
-            };
-            webload::run_webload_server(opts).await?;
+        Commands::Webload(args) => {
+            handle_webload(&cli.backend, args).await?;
         }
 
         Commands::Version => {
@@ -3837,5 +4258,110 @@ mod tests {
             }
             _ => panic!("expected SellerCmd::Start"),
         }
+    }
+
+    #[test]
+    fn test_webload_cli_parsing_default_command() {
+        let cli = Cli::try_parse_from(["proxybase-cli", "webload"]).expect("should parse 'proxybase-cli webload'");
+        match cli.command {
+            Commands::Webload(args) => {
+                assert!(args.cmd.is_none(), "default webload should have no subcmd");
+                assert_eq!(args.port, None);
+                assert!(!args.foreground, "default webload should not be foreground");
+                assert!(!args.no_open);
+            }
+            _ => panic!("expected Commands::Webload"),
+        }
+    }
+
+    #[test]
+    fn test_webload_cli_parsing_flags() {
+        let cli = Cli::try_parse_from([
+            "proxybase-cli",
+            "webload",
+            "--port",
+            "9090",
+            "--bind",
+            "0.0.0.0",
+            "--foreground",
+            "--no-open",
+            "--auth-user",
+            "testuser",
+            "--auth-pass",
+            "testpass123",
+        ])
+        .expect("should parse webload with direct flags");
+        match cli.command {
+            Commands::Webload(args) => {
+                assert_eq!(args.port, Some(9090));
+                assert_eq!(args.bind.as_deref(), Some("0.0.0.0"));
+                assert!(args.foreground);
+                assert!(args.no_open);
+                assert_eq!(args.auth_user.as_deref(), Some("testuser"));
+                assert_eq!(args.auth_pass.as_deref(), Some("testpass123"));
+            }
+            _ => panic!("expected Commands::Webload"),
+        }
+    }
+
+    #[test]
+    fn test_webload_cli_subcommands() {
+        // webload start
+        let cli_start = Cli::try_parse_from(["proxybase-cli", "webload", "start", "--port", "8888", "--foreground"]).unwrap();
+        match cli_start.command {
+            Commands::Webload(args) => match args.cmd {
+                Some(WebloadCmd::Start { port, foreground, .. }) => {
+                    assert_eq!(port, Some(8888));
+                    assert!(foreground);
+                }
+                _ => panic!("expected WebloadCmd::Start"),
+            },
+            _ => panic!("expected Commands::Webload"),
+        }
+
+        // webload stop
+        let cli_stop = Cli::try_parse_from(["proxybase-cli", "webload", "stop"]).unwrap();
+        match cli_stop.command {
+            Commands::Webload(args) => match args.cmd {
+                Some(WebloadCmd::Stop) => {}
+                _ => panic!("expected WebloadCmd::Stop"),
+            },
+            _ => panic!("expected Commands::Webload"),
+        }
+
+        // webload status
+        let cli_status = Cli::try_parse_from(["proxybase-cli", "webload", "status"]).unwrap();
+        match cli_status.command {
+            Commands::Webload(args) => match args.cmd {
+                Some(WebloadCmd::Status) => {}
+                _ => panic!("expected WebloadCmd::Status"),
+            },
+            _ => panic!("expected Commands::Webload"),
+        }
+
+        // webload install
+        let cli_install = Cli::try_parse_from(["proxybase-cli", "webload", "install"]).unwrap();
+        match cli_install.command {
+            Commands::Webload(args) => match args.cmd {
+                Some(WebloadCmd::Install) => {}
+                _ => panic!("expected WebloadCmd::Install"),
+            },
+            _ => panic!("expected Commands::Webload"),
+        }
+    }
+
+    #[test]
+    fn test_webload_daemon_config_serialization() {
+        let mut cfg = WebloadDaemonConfig::default();
+        cfg.port = 8787;
+        cfg.bind = "127.0.0.1".to_string();
+        cfg.auth_user = "admin".to_string();
+        cfg.auth_pass = "custompass".to_string();
+        let json = serde_json::to_string(&cfg).expect("should serialize");
+        let deserialized: WebloadDaemonConfig = serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(deserialized.port, 8787);
+        assert_eq!(deserialized.bind, "127.0.0.1");
+        assert_eq!(deserialized.auth_user, "admin");
+        assert_eq!(deserialized.auth_pass, "custompass");
     }
 }

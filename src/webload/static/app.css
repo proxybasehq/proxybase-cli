@@ -246,6 +246,131 @@ body {
   box-shadow: 0 0 8px var(--accent-emerald);
 }
 
+/* Production Gateway Status Banner */
+.backend-status-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.85rem 1.25rem;
+  margin: 1rem 1.5rem 0.5rem 1.5rem;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid var(--border-subtle);
+  gap: 1rem;
+  flex-wrap: wrap;
+  transition: all 0.25s ease;
+}
+
+.backend-status-card.online {
+  border-color: rgba(16, 185, 129, 0.4);
+  background: linear-gradient(90deg, rgba(16, 185, 129, 0.08) 0%, rgba(15, 23, 42, 0.75) 100%);
+}
+
+.backend-status-card.standby {
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+.backend-status-left {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+}
+
+.status-pulse-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+  transition: all 0.2s ease;
+}
+
+.backend-status-card.online .status-pulse-dot {
+  background: var(--accent-emerald);
+  box-shadow: 0 0 10px var(--accent-emerald);
+  animation: pulse-green 2s infinite;
+}
+
+@keyframes pulse-green {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+.backend-status-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.backend-status-headline-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.backend-status-headline {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.backend-tag-badge {
+  font-size: 0.65rem;
+  font-weight: 600;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  background: rgba(0, 242, 254, 0.15);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(0, 242, 254, 0.3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.backend-status-sub {
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
+.backend-status-sub strong {
+  color: #fff;
+}
+
+.backend-status-right {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.backend-metric {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.backend-metric .metric-label {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.backend-metric .metric-value {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.backend-metric .metric-value.highlight {
+  color: var(--accent-cyan);
+}
+
+.backend-status-card.online .backend-metric .metric-value.highlight {
+  color: var(--accent-emerald);
+}
+
 /* Ingestion Live Banner */
 .ingest-banner {
   background: rgba(15, 23, 42, 0.95);

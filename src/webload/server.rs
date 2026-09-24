@@ -498,6 +498,9 @@ pub struct WebloadStatsResponse {
     pub is_relay_running: bool,
     pub active_streams: u32,
     pub total_bytes_relayed: u64,
+    pub bytes_per_sec: u64,
+    pub active_upstream_paths: usize,
+    pub backend_url: String,
 }
 
 async fn handle_get_stats(
@@ -516,6 +519,9 @@ async fn handle_get_stats(
         is_relay_running,
         active_streams: telem.active_streams,
         total_bytes_relayed: telem.total_bytes_relayed,
+        bytes_per_sec: telem.bytes_per_sec,
+        active_upstream_paths: telem.active_upstream_paths,
+        backend_url: state.backend_url.clone(),
     }))
 }
 

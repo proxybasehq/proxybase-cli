@@ -164,7 +164,7 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
 async fn run_seller_supervisor(
     route_table: ActiveRouteTable,
     backend_url: String,
-    _db: WebloadDb,
+    db: WebloadDb,
 ) {
     let mut is_running_rx = route_table.is_running_watch();
     let routes_changed = route_table.routes_changed_notifier();
@@ -199,6 +199,10 @@ async fn run_seller_supervisor(
                 eprintln!("[webload:seller] Warning: Failed to register seller node: {:#}", e);
             } else {
                 eprintln!("[webload:seller] Seller node registered successfully with backend.");
+            }
+
+            if let Ok(active) = db.get_active_proxies() {
+                route_table.populate(active).await;
             }
 
             let paths = route_table.get_all_active_paths().await;
