@@ -26,6 +26,7 @@ const DEFAULT_BACKEND_URL: &str = if cfg!(debug_assertions) {
 
 #[derive(Parser)]
 #[command(name = "proxybase-cli")]
+#[command(version)]
 #[command(about = "ProxyBase Markets CLI — wallet, seller, and buyer operations")]
 struct Cli {
     /// Backend API base URL
@@ -789,7 +790,13 @@ async fn handle_webload(
             daemon.install_service()?;
             println!("Webload service installed. It will auto-start on boot and automatically restart on failure.");
             #[cfg(target_os = "linux")]
-            println!("User-level systemd service: ~/.config/systemd/user/proxybase-webload.service");
+            {
+                println!("User-level systemd service: ~/.config/systemd/user/proxybase-webload.service");
+                let _ = std::process::Command::new("loginctl")
+                    .arg("enable-linger")
+                    .output();
+                println!("Note: Enabled user lingering ('loginctl enable-linger') so the service persists after SSH disconnect.");
+            }
             #[cfg(target_os = "macos")]
             println!("User-level launchd agent: ~/Library/LaunchAgents/com.proxybase-webload.plist");
             #[cfg(target_os = "windows")]
@@ -989,6 +996,18 @@ async fn execute_webload_start(
         cmd.stdin(std::process::Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
         let child = cmd.spawn().context("Failed to spawn webload daemon process")?;
 
         if let Some(parent) = pid_path.parent() {
@@ -2933,6 +2952,13 @@ async fn main() -> Result<()> {
                     let daemon = seller_daemon();
                     daemon.install_service()?;
                     println!("Seller service installed. It will auto-start on boot.");
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = std::process::Command::new("loginctl")
+                            .arg("enable-linger")
+                            .output();
+                        println!("Note: Enabled user lingering ('loginctl enable-linger') so the service persists after SSH disconnect.");
+                    }
                     return Ok(());
                 }
                 _ => {}
@@ -3144,6 +3170,18 @@ async fn main() -> Result<()> {
                         cmd.stdin(std::process::Stdio::null())
                            .stdout(log_file.try_clone()?)
                            .stderr(log_file);
+
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::CommandExt;
+                            unsafe {
+                                cmd.pre_exec(|| {
+                                    libc::setsid();
+                                    Ok(())
+                                });
+                            }
+                        }
+
                         let child = cmd.spawn()
                             .context("Failed to spawn seller daemon process")?;
 
