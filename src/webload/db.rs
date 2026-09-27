@@ -185,7 +185,7 @@ impl WebloadDb {
     /// Insert a batch of parsed proxies in a single transaction.
     /// Deduplicates against existing proxies by address + username.
     pub fn insert_batch(&self, proxies: &[ParsedProxy]) -> Result<(usize, usize)> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -244,7 +244,7 @@ impl WebloadDb {
 
     /// Query proxies with server-side pagination, searching, and filtering.
     pub fn query_proxies(&self, filter: &ProxyQueryFilter) -> Result<PaginatedProxies> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         let page = filter.page.unwrap_or(1).max(1);
         let limit = filter.limit.unwrap_or(50).clamp(1, 1000);
@@ -389,7 +389,7 @@ impl WebloadDb {
     /// Toggle status of an individual proxy by ID (between 'active' and 'paused').
     /// Returns the updated status and the proxy record.
     pub fn toggle_proxy_status(&self, id: i64) -> Result<(String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let (current_status, path_id): (String, String) = conn.query_row(
             "SELECT status, path_id FROM proxies WHERE id = ?",
             [id],
@@ -412,7 +412,7 @@ impl WebloadDb {
 
     /// Retrieve a single proxy record by ID.
     pub fn get_proxy(&self, id: i64) -> Result<Option<ProxyRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, path_id, address, host, port, username, password,
                     country, category, label, raw_input, status,
@@ -451,7 +451,7 @@ impl WebloadDb {
 
     /// Set status of an individual proxy by ID explicitly.
     pub fn set_proxy_status(&self, id: i64, status: &str) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let path_id: String = conn.query_row(
             "SELECT path_id FROM proxies WHERE id = ?",
             [id],
@@ -469,7 +469,7 @@ impl WebloadDb {
     /// Bulk update status for an explicit list of proxy IDs.
     /// Returns the updated path_ids.
     pub fn bulk_update_status(&self, ids: &[i64], status: &str) -> Result<Vec<String>> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
 
         let mut path_ids = Vec::new();
@@ -491,7 +491,7 @@ impl WebloadDb {
 
     /// Bulk update status for all proxies matching a query filter.
     pub fn bulk_update_by_filter(&self, filter: &ProxyQueryFilter, status: &str) -> Result<Vec<String>> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
 
         let mut conditions = Vec::new();
@@ -560,7 +560,7 @@ impl WebloadDb {
 
     /// Delete a proxy by ID.
     pub fn delete_proxy(&self, id: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let path_id: Option<String> = conn
             .query_row("SELECT path_id FROM proxies WHERE id = ?", [id], |r| r.get(0))
             .ok();
@@ -579,7 +579,7 @@ impl WebloadDb {
         latency_ms: Option<u64>,
         is_success: bool,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -611,7 +611,7 @@ impl WebloadDb {
 
     /// Fetch all active proxies for populating the hot seller relay routing table.
     pub fn get_active_proxies(&self) -> Result<Vec<(String, crate::UpstreamProxy)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT path_id, address, username, password, country, category, label
              FROM proxies WHERE status = 'active'"
@@ -648,7 +648,7 @@ impl WebloadDb {
 
     /// Get aggregated metrics for dashboard summary cards.
     pub fn get_aggregate_stats(&self) -> Result<AggregateStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         let total_proxies: usize = conn.query_row("SELECT COUNT(*) FROM proxies", [], |r| r.get(0))?;
         let active_proxies: usize = conn.query_row("SELECT COUNT(*) FROM proxies WHERE status = 'active'", [], |r| r.get(0))?;

@@ -156,8 +156,42 @@ pub async fn run_webload_server(opts: WebloadOptions) -> Result<()> {
         let _ = open::that(&ui_url);
     }
 
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            eprintln!("\n[webload] Received shutdown signal (Ctrl+C). Stopping server...");
+        }
+        _ = terminate => {
+            eprintln!("\n[webload] Received SIGTERM signal. Stopping server...");
+        }
+    }
 }
 
 /// Background supervisor that starts or pauses the multiplexed seller relay based on route table status.

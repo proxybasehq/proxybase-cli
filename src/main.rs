@@ -67,14 +67,17 @@ pub struct WebloadArgs {
     /// Optional password for Web UI authentication (default: auto-generated or saved)
     #[arg(long)]
     pub auth_pass: Option<String>,
-    /// Run in foreground (don't daemonize). Used internally by the service manager.
+    /// Run in foreground (don't daemonize). Default when running inside tmux or screen.
     #[arg(long)]
     pub foreground: bool,
+    /// Force running as a background daemon (even in tmux/screen).
+    #[arg(long, short = 'd')]
+    pub daemon: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum WebloadCmd {
-    /// Start webload (daemonizes by default, use --foreground to keep in terminal)
+    /// Start webload (runs in foreground in tmux/screen, daemonizes otherwise; use --foreground or --daemon to force)
     Start {
         /// Initial proxy file to import
         #[arg(short, long)]
@@ -103,6 +106,9 @@ pub enum WebloadCmd {
         /// Run in foreground (don't daemonize)
         #[arg(long)]
         foreground: bool,
+        /// Force running as a background daemon (even in tmux/screen)
+        #[arg(long, short = 'd')]
+        daemon: bool,
     },
     /// Stop the background webload daemon and autostart service
     Stop,
@@ -659,6 +665,7 @@ async fn handle_webload(
     let auth_user = args.auth_user;
     let auth_pass = args.auth_pass;
     let foreground = args.foreground;
+    let daemon = args.daemon;
 
     match subcmd {
         Some(WebloadCmd::Stop) => {
@@ -824,6 +831,7 @@ async fn handle_webload(
                     auth_user: r_user.or(auth_user),
                     auth_pass: r_pass.or(auth_pass),
                     foreground,
+                    daemon: false,
                 }),
                 file: None,
                 port: None,
@@ -834,6 +842,7 @@ async fn handle_webload(
                 auth_user: None,
                 auth_pass: None,
                 foreground: false,
+                daemon: false,
             };
             Box::pin(handle_webload(cli_backend, start_args)).await
         }
@@ -848,6 +857,7 @@ async fn handle_webload(
             auth_user: au,
             auth_pass: ap,
             foreground: fg,
+            daemon: dm,
         }) => {
             execute_webload_start(
                 cli_backend,
@@ -860,6 +870,8 @@ async fn handle_webload(
                 au.or(auth_user),
                 ap.or(auth_pass),
                 foreground || fg,
+                daemon || dm,
+                false,
             )
             .await
         }
@@ -876,6 +888,8 @@ async fn handle_webload(
                 auth_user,
                 auth_pass,
                 foreground,
+                daemon,
+                true,
             )
             .await
         }
@@ -893,7 +907,33 @@ async fn execute_webload_start(
     auth_user: Option<String>,
     auth_pass: Option<String>,
     foreground: bool,
+    daemon: bool,
+    is_direct_webload_cmd: bool,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // Automatically enable user lingering on Linux so background and tmux processes
+        // persist across SSH disconnects without being killed by systemd-logind.
+        let _ = std::process::Command::new("loginctl")
+            .arg("enable-linger")
+            .output();
+    }
+
+    let in_multiplexer = std::env::var("TMUX").is_ok() || std::env::var("STY").is_ok();
+    let run_in_foreground = if daemon {
+        false
+    } else if foreground {
+        true
+    } else if in_multiplexer {
+        println!("[webload] Terminal multiplexer detected (tmux/screen) — running in foreground to keep your session active.");
+        println!("[webload] (Use 'proxybase-cli webload start --daemon' to force background daemon mode)");
+        true
+    } else if is_direct_webload_cmd {
+        true
+    } else {
+        false
+    };
+
     let mut cfg = load_webload_config_or_default();
     if let Some(p) = port {
         cfg.port = p;
@@ -915,7 +955,7 @@ async fn execute_webload_start(
     }
     if let Some(ref p) = auth_pass {
         cfg.auth_pass = p.clone();
-    } else if !foreground || cfg.auth_pass == "mysecurepass" || cfg.auth_pass.is_empty() {
+    } else if !run_in_foreground || cfg.auth_pass == "mysecurepass" || cfg.auth_pass.is_empty() {
         cfg.auth_pass = format!("pb_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     }
     cfg.backend_url = cli_backend.to_string();
@@ -929,7 +969,7 @@ async fn execute_webload_start(
     let ui_url = format!("http://{}:{}", cfg.bind, cfg.port);
     let pid_path = wallet_dir().join("proxybase-webload.pid");
 
-    if foreground {
+    if run_in_foreground {
         if let Some(parent) = pid_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -948,6 +988,7 @@ async fn execute_webload_start(
         };
         let res = webload::run_webload_server(opts).await;
         let _ = std::fs::remove_file(&pid_path);
+        println!("[webload] Webload server stopped.");
         res
     } else {
         let daemon = webload_daemon();
@@ -2418,6 +2459,7 @@ async fn try_multiplexed_tunnel_connection(
             }
             _ = ping_tick.tick() => { let _ = relay_tx.send(Message::Ping(vec![].into())); }
             _ = heartbeat_tick.tick() => {
+                relay_tasks.retain(|h| !h.is_finished());
                 let current_streams = active.lock().await.len() as u32;
                 let hb = serde_json::json!({
                     "type": "multiplex_heartbeat",
@@ -2513,6 +2555,7 @@ async fn try_multiplexed_tunnel_connection(
                                             rt.unregister_stream(&sid).await;
                                         }
                                     });
+                                    relay_tasks.retain(|h| !h.is_finished());
                                     relay_tasks.push(handle);
                                 }
                                 _ => {}
@@ -4358,12 +4401,13 @@ mod tests {
     #[test]
     fn test_webload_cli_subcommands() {
         // webload start
-        let cli_start = Cli::try_parse_from(["proxybase-cli", "webload", "start", "--port", "8888", "--foreground"]).unwrap();
-        match cli_start.command {
+        // webload start with daemon flag
+        let cli_daemon = Cli::try_parse_from(["proxybase-cli", "webload", "start", "--port", "8888", "--daemon"]).unwrap();
+        match cli_daemon.command {
             Commands::Webload(args) => match args.cmd {
-                Some(WebloadCmd::Start { port, foreground, .. }) => {
+                Some(WebloadCmd::Start { port, daemon, .. }) => {
                     assert_eq!(port, Some(8888));
-                    assert!(foreground);
+                    assert!(daemon);
                 }
                 _ => panic!("expected WebloadCmd::Start"),
             },
